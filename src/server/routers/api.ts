@@ -487,271 +487,1079 @@ apiRouter.patch(
 // 3. VEHICLE MODULE ENDPOINTS
 // ============================================================================
 
+type VehicleSortField =
+  | "created_at"
+  | "registration_number"
+  | "vehicle_name"
+  | "vehicle_type"
+  | "maximum_load_capacity"
+  | "odometer"
+  | "acquisition_cost"
+  | "region"
+  | "manufacture_year"
+  | "fuel_type"
+  | "status";
+
+const VEHICLE_SORT_FIELDS = new Set<VehicleSortField>([
+  "created_at",
+  "registration_number",
+  "vehicle_name",
+  "vehicle_type",
+  "maximum_load_capacity",
+  "odometer",
+  "acquisition_cost",
+  "region",
+  "manufacture_year",
+  "fuel_type",
+  "status",
+]);
+
+const VEHICLE_REGISTRATION_PATTERN =
+  /^[A-Z0-9-]{4,20}$/;
+const MIN_MANUFACTURE_YEAR = 1900;
+
+function hasOwnProperty(
+  value: object,
+  key: PropertyKey,
+): boolean {
+  return Object.prototype.hasOwnProperty.call(
+    value,
+    key,
+  );
+}
+
+function getSingleQueryValue(
+  value: unknown,
+): string {
+  return typeof value === "string"
+    ? value.trim()
+    : "";
+}
+
+function parsePositiveInteger(
+  value: unknown,
+  fallback: number,
+  maximum: number,
+): number {
+  const parsed = Number.parseInt(
+    getSingleQueryValue(value),
+    10,
+  );
+
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return fallback;
+  }
+
+  return Math.min(parsed, maximum);
+}
+
+function parseFiniteNumber(
+  value: unknown,
+): number | null {
+  if (
+    value === null ||
+    value === undefined ||
+    (typeof value === "string" && !value.trim())
+  ) {
+    return null;
+  }
+
+  const parsed = Number(value);
+
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeVehicleRegistration(
+  value: string,
+): string {
+  return value
+    .trim()
+    .replace(/\s+/g, "")
+    .toUpperCase();
+}
+
+function normalizeVehicleText(
+  value: string,
+): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function isVehicleType(
+  value: unknown,
+): value is VehicleType {
+  return (
+    typeof value === "string" &&
+    Object.values(VehicleType).includes(
+      value as VehicleType,
+    )
+  );
+}
+
+function isFuelType(
+  value: unknown,
+): value is FuelType {
+  return (
+    typeof value === "string" &&
+    Object.values(FuelType).includes(
+      value as FuelType,
+    )
+  );
+}
+
+function compareVehicleValues(
+  first: Vehicle,
+  second: Vehicle,
+  field: VehicleSortField,
+  order: 1 | -1,
+): number {
+  const firstValue = first[field];
+  const secondValue = second[field];
+
+  if (
+    typeof firstValue === "number" &&
+    typeof secondValue === "number"
+  ) {
+    return (firstValue - secondValue) * order;
+  }
+
+  return (
+    String(firstValue).localeCompare(
+      String(secondValue),
+      undefined,
+      {
+        numeric: true,
+        sensitivity: "base",
+      },
+    ) * order
+  );
+}
+
 apiRouter.get(
   "/vehicles/available",
   authenticateJWT,
   requireRole(VEHICLE_READ_ROLES),
-  (req, res) => {
-  // Vehicles that can be dispatched
-  const result = db.vehicles.filter(
-    v => v.status === VehicleStatus.AVAILABLE
-  );
-  res.json(result);
-});
+  (_req, res) => {
+    const result = db.vehicles
+      .filter(
+        (vehicle) =>
+          vehicle.status ===
+          VehicleStatus.AVAILABLE,
+      )
+      .sort((first, second) =>
+        first.registration_number.localeCompare(
+          second.registration_number,
+          undefined,
+          {
+            numeric: true,
+            sensitivity: "base",
+          },
+        ),
+      );
+
+    return res.json(result);
+  },
+);
 
 apiRouter.get(
   "/vehicles",
   authenticateJWT,
   requireRole(VEHICLE_READ_ROLES),
   (req, res) => {
-  const { search, status, vehicle_type, region, sort_by, sort_order } = req.query;
-
-  let list = [...db.vehicles];
-
-  // Search filter
-  if (search) {
-    const q = (search as string).toLowerCase();
-    list = list.filter(
-      v =>
-        v.registration_number.toLowerCase().includes(q) ||
-        v.vehicle_name.toLowerCase().includes(q) ||
-        v.model.toLowerCase().includes(q)
+    const search = getSingleQueryValue(
+      req.query.search,
+    ).toLowerCase();
+    const status = getSingleQueryValue(
+      req.query.status,
     );
-  }
+    const vehicleType = getSingleQueryValue(
+      req.query.vehicle_type,
+    );
+    const region = getSingleQueryValue(
+      req.query.region,
+    ).toLowerCase();
+    const requestedSortField =
+      getSingleQueryValue(req.query.sort_by) ||
+      "created_at";
+    const requestedSortOrder =
+      getSingleQueryValue(req.query.sort_order) ||
+      "desc";
 
-  // Filters
-  if (status) {
-    list = list.filter(v => v.status === status);
-  }
-  if (vehicle_type) {
-    list = list.filter(v => v.vehicle_type === vehicle_type);
-  }
-  if (region) {
-    list = list.filter(v => v.region.toLowerCase() === (region as string).toLowerCase());
-  }
+    if (
+      status &&
+      !Object.values(VehicleStatus).includes(
+        status as VehicleStatus,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Invalid vehicle status filter.",
+      });
+    }
 
-  // Sorting
-  if (sort_by) {
-    const field = sort_by as keyof Vehicle;
-    const order = sort_order === "desc" ? -1 : 1;
-    list.sort((a, b) => {
-      const valA = a[field];
-      const valB = b[field];
-      if (valA === undefined || valB === undefined) return 0;
-      if (typeof valA === "string" && typeof valB === "string") {
-        return valA.localeCompare(valB) * order;
-      }
-      return ((valA as number) - (valB as number)) * order;
+    if (
+      vehicleType &&
+      !Object.values(VehicleType).includes(
+        vehicleType as VehicleType,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Invalid vehicle type filter.",
+      });
+    }
+
+    if (
+      !VEHICLE_SORT_FIELDS.has(
+        requestedSortField as VehicleSortField,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Invalid vehicle sort field.",
+      });
+    }
+
+    if (
+      requestedSortOrder !== "asc" &&
+      requestedSortOrder !== "desc"
+    ) {
+      return res.status(400).json({
+        error:
+          "Vehicle sort order must be asc or desc.",
+      });
+    }
+
+    let list = [...db.vehicles];
+
+    if (search) {
+      list = list.filter((vehicle) =>
+        [
+          vehicle.registration_number,
+          vehicle.vehicle_name,
+          vehicle.model,
+          vehicle.region,
+        ].some((value) =>
+          value.toLowerCase().includes(search),
+        ),
+      );
+    }
+
+    if (status) {
+      list = list.filter(
+        (vehicle) => vehicle.status === status,
+      );
+    }
+
+    if (vehicleType) {
+      list = list.filter(
+        (vehicle) =>
+          vehicle.vehicle_type === vehicleType,
+      );
+    }
+
+    if (region) {
+      list = list.filter((vehicle) =>
+        vehicle.region.toLowerCase().includes(region),
+      );
+    }
+
+    const sortField =
+      requestedSortField as VehicleSortField;
+    const sortOrder: 1 | -1 =
+      requestedSortOrder === "asc" ? 1 : -1;
+
+    list.sort((first, second) =>
+      compareVehicleValues(
+        first,
+        second,
+        sortField,
+        sortOrder,
+      ),
+    );
+
+    const pageSize = parsePositiveInteger(
+      req.query.page_size,
+      15,
+      100,
+    );
+    const requestedPage = parsePositiveInteger(
+      req.query.page,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const total = list.length;
+    const totalPages = Math.max(
+      1,
+      Math.ceil(total / pageSize),
+    );
+    const page = Math.min(
+      requestedPage,
+      totalPages,
+    );
+    const startIndex = (page - 1) * pageSize;
+    const data = list.slice(
+      startIndex,
+      startIndex + pageSize,
+    );
+
+    return res.json({
+      data,
+      total,
+      page,
+      page_size: pageSize,
+      total_pages: totalPages,
     });
-  } else {
-    // default newest first
-    list.sort((a, b) => b.created_at.localeCompare(a.created_at));
-  }
-
-  // Simple Pagination
-  const page = parseInt(req.query.page as string, 10) || 1;
-  const pageSize = parseInt(req.query.page_size as string, 10) || 15;
-  const total = list.length;
-  const paginated = list.slice((page - 1) * pageSize, page * pageSize);
-
-  res.json({
-    data: paginated,
-    total,
-    page,
-    page_size: pageSize
-  });
-});
+  },
+);
 
 apiRouter.get(
   "/vehicles/:id",
   authenticateJWT,
   requireRole(VEHICLE_READ_ROLES),
   (req, res) => {
-  const vehicle = db.vehicles.find(v => v.id === req.params.id);
-  if (!vehicle) return res.status(404).json({ error: "Vehicle not found." });
-  res.json(vehicle);
-});
+    const vehicle = db.vehicles.find(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
+
+    if (!vehicle) {
+      return res.status(404).json({
+        error: "Vehicle not found.",
+      });
+    }
+
+    return res.json(vehicle);
+  },
+);
 
 apiRouter.get(
   "/vehicles/:id/history",
   authenticateJWT,
   requireRole(VEHICLE_READ_ROLES),
   (req, res) => {
-  const trips = db.trips.filter(t => t.vehicle_id === req.params.id);
-  const maintenance = db.maintenance_logs.filter(m => m.vehicle_id === req.params.id);
-  const expenses = db.expenses.filter(e => e.vehicle_id === req.params.id);
-  const fuel = db.fuel_logs.filter(f => f.vehicle_id === req.params.id);
+    const vehicle = db.vehicles.find(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
 
-  res.json({
-    trips,
-    maintenance,
-    expenses,
-    fuel
-  });
-});
-
-apiRouter.post("/vehicles", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
-  const {
-    registration_number,
-    vehicle_name,
-    model,
-    vehicle_type,
-    maximum_load_capacity,
-    odometer,
-    acquisition_cost,
-    region,
-    manufacture_year,
-    fuel_type
-  } = req.body;
-
-  if (!registration_number || !vehicle_name || !model || !vehicle_type || !maximum_load_capacity || !region) {
-    return res.status(400).json({ error: "Missing required fields." });
-  }
-
-  const normReg = registration_number.replace(/\s+/g, "").toUpperCase();
-  const existing = db.vehicles.find(v => v.registration_number.replace(/\s+/g, "").toUpperCase() === normReg);
-  if (existing) {
-    return res.status(400).json({ error: `Vehicle registration number ${registration_number} already exists.` });
-  }
-
-  if (maximum_load_capacity <= 0) {
-    return res.status(400).json({ error: "Maximum load capacity must be positive." });
-  }
-  if (odometer !== undefined && odometer < 0) {
-    return res.status(400).json({ error: "Odometer cannot be negative." });
-  }
-  if (acquisition_cost !== undefined && acquisition_cost < 0) {
-    return res.status(400).json({ error: "Acquisition cost cannot be negative." });
-  }
-
-  const newVehicle: Vehicle = {
-    id: "vh_" + Math.random().toString(36).substr(2, 9),
-    registration_number: registration_number.toUpperCase(),
-    vehicle_name,
-    model,
-    vehicle_type: vehicle_type as VehicleType,
-    maximum_load_capacity: Number(maximum_load_capacity),
-    odometer: Number(odometer || 0),
-    acquisition_cost: Number(acquisition_cost || 0),
-    region,
-    manufacture_year: Number(manufacture_year || new Date().getFullYear()),
-    fuel_type: fuel_type as FuelType,
-    status: VehicleStatus.AVAILABLE,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
-
-  db.vehicles.push(newVehicle);
-  db.save();
-
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Created vehicle ${newVehicle.vehicle_name} (${newVehicle.registration_number})`,
-    "VEHICLE",
-    newVehicle.id
-  );
-
-  res.status(201).json(newVehicle);
-});
-
-apiRouter.put("/vehicles/:id", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
-  const vehicle = db.vehicles.find(v => v.id === req.params.id);
-  if (!vehicle) return res.status(404).json({ error: "Vehicle not found." });
-
-  const {
-    registration_number,
-    vehicle_name,
-    model,
-    vehicle_type,
-    maximum_load_capacity,
-    odometer,
-    acquisition_cost,
-    region,
-    manufacture_year,
-    fuel_type,
-    status
-  } = req.body;
-
-  if (registration_number) {
-    const normReg = registration_number.replace(/\s+/g, "").toUpperCase();
-    const existing = db.vehicles.find(v => v.id !== vehicle.id && v.registration_number.replace(/\s+/g, "").toUpperCase() === normReg);
-    if (existing) {
-      return res.status(400).json({ error: "Vehicle registration number already exists." });
+    if (!vehicle) {
+      return res.status(404).json({
+        error: "Vehicle not found.",
+      });
     }
-    vehicle.registration_number = registration_number.toUpperCase();
-  }
 
-  if (maximum_load_capacity !== undefined) {
-    if (maximum_load_capacity <= 0) return res.status(400).json({ error: "Maximum load capacity must be positive." });
-    vehicle.maximum_load_capacity = Number(maximum_load_capacity);
-  }
+    const newestFirst = <
+      Entity extends { created_at: string },
+    >(
+      first: Entity,
+      second: Entity,
+    ): number =>
+      second.created_at.localeCompare(
+        first.created_at,
+      );
 
-  if (odometer !== undefined) {
-    if (odometer < 0) return res.status(400).json({ error: "Odometer cannot be negative." });
-    vehicle.odometer = Number(odometer);
-  }
+    const trips = db.trips
+      .filter(
+        (trip) => trip.vehicle_id === vehicle.id,
+      )
+      .sort(newestFirst);
+    const maintenance = db.maintenance_logs
+      .filter(
+        (log) => log.vehicle_id === vehicle.id,
+      )
+      .sort(newestFirst);
+    const expenses = db.expenses
+      .filter(
+        (expense) =>
+          expense.vehicle_id === vehicle.id,
+      )
+      .sort(newestFirst);
+    const fuel = db.fuel_logs
+      .filter(
+        (fuelLog) =>
+          fuelLog.vehicle_id === vehicle.id,
+      )
+      .sort(newestFirst);
 
-  if (acquisition_cost !== undefined) {
-    if (acquisition_cost < 0) return res.status(400).json({ error: "Acquisition cost cannot be negative." });
-    vehicle.acquisition_cost = Number(acquisition_cost);
-  }
+    return res.json({
+      trips,
+      maintenance,
+      expenses,
+      fuel,
+    });
+  },
+);
 
-  if (vehicle_name) vehicle.vehicle_name = vehicle_name;
-  if (model) vehicle.model = model;
-  if (vehicle_type) vehicle.vehicle_type = vehicle_type as VehicleType;
-  if (region) vehicle.region = region;
-  if (manufacture_year) vehicle.manufacture_year = Number(manufacture_year);
-  if (fuel_type) vehicle.fuel_type = fuel_type as FuelType;
+apiRouter.post(
+  "/vehicles",
+  authenticateJWT,
+  requireRole([
+    UserRole.ADMIN,
+    UserRole.FLEET_MANAGER,
+  ]),
+  (req: AuthenticatedRequest, res) => {
+    const body = req.body ?? {};
 
-  const oldStatus = vehicle.status;
-  if (status && Object.values(VehicleStatus).includes(status)) {
-    // If retiring
-    if (status === VehicleStatus.RETIRED && oldStatus === VehicleStatus.ON_TRIP) {
-      return res.status(400).json({ error: "Cannot retire a vehicle currently on a trip." });
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error: "A valid vehicle payload is required.",
+      });
     }
-    vehicle.status = status as VehicleStatus;
-  }
 
-  vehicle.updated_at = new Date().toISOString();
-  db.save();
+    const registrationNumber =
+      typeof body.registration_number === "string"
+        ? normalizeVehicleRegistration(
+            body.registration_number,
+          )
+        : "";
+    const vehicleName =
+      typeof body.vehicle_name === "string"
+        ? normalizeVehicleText(body.vehicle_name)
+        : "";
+    const model =
+      typeof body.model === "string"
+        ? normalizeVehicleText(body.model)
+        : "";
+    const region =
+      typeof body.region === "string"
+        ? normalizeVehicleText(body.region)
+        : "";
+    const maximumLoadCapacity =
+      parseFiniteNumber(
+        body.maximum_load_capacity,
+      );
+    const odometer =
+      body.odometer === undefined
+        ? 0
+        : parseFiniteNumber(body.odometer);
+    const acquisitionCost =
+      body.acquisition_cost === undefined
+        ? 0
+        : parseFiniteNumber(
+            body.acquisition_cost,
+          );
+    const manufactureYear =
+      body.manufacture_year === undefined
+        ? new Date().getFullYear()
+        : parseFiniteNumber(
+            body.manufacture_year,
+          );
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Updated vehicle ${vehicle.vehicle_name}`,
-    "VEHICLE",
-    vehicle.id,
-    oldStatus !== vehicle.status ? oldStatus : undefined,
-    oldStatus !== vehicle.status ? vehicle.status : undefined
-  );
+    if (
+      !VEHICLE_REGISTRATION_PATTERN.test(
+        registrationNumber,
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "Registration number must contain 4–20 letters, numbers, or hyphens.",
+      });
+    }
 
-  res.json(vehicle);
-});
+    if (
+      vehicleName.length < 2 ||
+      vehicleName.length > 80
+    ) {
+      return res.status(400).json({
+        error:
+          "Vehicle name must contain between 2 and 80 characters.",
+      });
+    }
 
-apiRouter.delete("/vehicles/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
-  const index = db.vehicles.findIndex(v => v.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Vehicle not found." });
+    if (model.length < 2 || model.length > 80) {
+      return res.status(400).json({
+        error:
+          "Model must contain between 2 and 80 characters.",
+      });
+    }
 
-  const vehicle = db.vehicles[index];
-  if (vehicle.status === VehicleStatus.ON_TRIP) {
-    return res.status(400).json({ error: "Cannot delete a vehicle while it is On Trip." });
-  }
+    if (region.length < 2 || region.length > 80) {
+      return res.status(400).json({
+        error:
+          "Region must contain between 2 and 80 characters.",
+      });
+    }
 
-  db.vehicles.splice(index, 1);
-  db.save();
+    if (!isVehicleType(body.vehicle_type)) {
+      return res.status(400).json({
+        error: "A valid vehicle type is required.",
+      });
+    }
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Deleted vehicle ${vehicle.vehicle_name} (${vehicle.registration_number})`,
-    "VEHICLE",
-    vehicle.id
-  );
+    if (!isFuelType(body.fuel_type)) {
+      return res.status(400).json({
+        error: "A valid fuel type is required.",
+      });
+    }
 
-  res.json({ success: true });
-});
+    if (
+      maximumLoadCapacity === null ||
+      maximumLoadCapacity <= 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Maximum load capacity must be greater than zero.",
+      });
+    }
 
+    if (odometer === null || odometer < 0) {
+      return res.status(400).json({
+        error: "Odometer must be zero or greater.",
+      });
+    }
+
+    if (
+      acquisitionCost === null ||
+      acquisitionCost < 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Acquisition cost must be zero or greater.",
+      });
+    }
+
+    const maximumManufactureYear =
+      new Date().getFullYear() + 1;
+
+    if (
+      manufactureYear === null ||
+      !Number.isInteger(manufactureYear) ||
+      manufactureYear < MIN_MANUFACTURE_YEAR ||
+      manufactureYear > maximumManufactureYear
+    ) {
+      return res.status(400).json({
+        error: `Manufacture year must be between ${MIN_MANUFACTURE_YEAR} and ${maximumManufactureYear}.`,
+      });
+    }
+
+    const duplicateVehicle = db.vehicles.find(
+      (vehicle) =>
+        normalizeVehicleRegistration(
+          vehicle.registration_number,
+        ) === registrationNumber,
+    );
+
+    if (duplicateVehicle) {
+      return res.status(409).json({
+        error: `Vehicle registration number ${registrationNumber} already exists.`,
+      });
+    }
+
+    const now = new Date().toISOString();
+    const newVehicle: Vehicle = {
+      id: db.generateId("vh"),
+      registration_number: registrationNumber,
+      vehicle_name: vehicleName,
+      model,
+      vehicle_type: body.vehicle_type,
+      maximum_load_capacity:
+        maximumLoadCapacity,
+      odometer,
+      acquisition_cost: acquisitionCost,
+      region,
+      manufacture_year: manufactureYear,
+      fuel_type: body.fuel_type,
+      status: VehicleStatus.AVAILABLE,
+      created_at: now,
+      updated_at: now,
+    };
+
+    db.vehicles.push(newVehicle);
+
+    try {
+      db.save();
+    } catch (error) {
+      const index = db.vehicles.findIndex(
+        (vehicle) => vehicle.id === newVehicle.id,
+      );
+
+      if (index >= 0) {
+        db.vehicles.splice(index, 1);
+      }
+
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Created vehicle ${newVehicle.vehicle_name} (${newVehicle.registration_number})`,
+      "VEHICLE",
+      newVehicle.id,
+    );
+
+    return res.status(201).json(newVehicle);
+  },
+);
+
+apiRouter.put(
+  "/vehicles/:id",
+  authenticateJWT,
+  requireRole([
+    UserRole.ADMIN,
+    UserRole.FLEET_MANAGER,
+  ]),
+  (req: AuthenticatedRequest, res) => {
+    const vehicleIndex = db.vehicles.findIndex(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
+
+    if (vehicleIndex === -1) {
+      return res.status(404).json({
+        error: "Vehicle not found.",
+      });
+    }
+
+    const vehicle = db.vehicles[vehicleIndex];
+
+    if (vehicle.status === VehicleStatus.ON_TRIP) {
+      return res.status(409).json({
+        error:
+          "Complete or cancel the active trip before editing this vehicle.",
+      });
+    }
+
+    const body = req.body ?? {};
+
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error: "A valid vehicle payload is required.",
+      });
+    }
+
+    if (hasOwnProperty(body, "status")) {
+      return res.status(400).json({
+        error:
+          "Vehicle status cannot be edited directly. Use trip, maintenance, or retirement workflows.",
+      });
+    }
+
+    const editableFields = [
+      "registration_number",
+      "vehicle_name",
+      "model",
+      "vehicle_type",
+      "maximum_load_capacity",
+      "odometer",
+      "acquisition_cost",
+      "region",
+      "manufacture_year",
+      "fuel_type",
+    ] as const;
+
+    const hasEditableField = editableFields.some(
+      (field) => hasOwnProperty(body, field),
+    );
+
+    if (!hasEditableField) {
+      return res.status(400).json({
+        error: "No editable vehicle fields were supplied.",
+      });
+    }
+
+    // Validate against a copy so a rejected request cannot partially mutate
+    // the in-memory database before db.save() is called.
+    const updatedVehicle: Vehicle = {
+      ...vehicle,
+    };
+
+    if (hasOwnProperty(body, "registration_number")) {
+      if (
+        typeof body.registration_number !== "string"
+      ) {
+        return res.status(400).json({
+          error:
+            "Registration number must be a string.",
+        });
+      }
+
+      const registrationNumber =
+        normalizeVehicleRegistration(
+          body.registration_number,
+        );
+
+      if (
+        !VEHICLE_REGISTRATION_PATTERN.test(
+          registrationNumber,
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            "Registration number must contain 4–20 letters, numbers, or hyphens.",
+        });
+      }
+
+      const duplicateVehicle = db.vehicles.find(
+        (candidate) =>
+          candidate.id !== vehicle.id &&
+          normalizeVehicleRegistration(
+            candidate.registration_number,
+          ) === registrationNumber,
+      );
+
+      if (duplicateVehicle) {
+        return res.status(409).json({
+          error:
+            "Vehicle registration number already exists.",
+        });
+      }
+
+      updatedVehicle.registration_number =
+        registrationNumber;
+    }
+
+    if (hasOwnProperty(body, "vehicle_name")) {
+      if (typeof body.vehicle_name !== "string") {
+        return res.status(400).json({
+          error: "Vehicle name must be a string.",
+        });
+      }
+
+      const vehicleName = normalizeVehicleText(
+        body.vehicle_name,
+      );
+
+      if (
+        vehicleName.length < 2 ||
+        vehicleName.length > 80
+      ) {
+        return res.status(400).json({
+          error:
+            "Vehicle name must contain between 2 and 80 characters.",
+        });
+      }
+
+      updatedVehicle.vehicle_name = vehicleName;
+    }
+
+    if (hasOwnProperty(body, "model")) {
+      if (typeof body.model !== "string") {
+        return res.status(400).json({
+          error: "Model must be a string.",
+        });
+      }
+
+      const model = normalizeVehicleText(body.model);
+
+      if (model.length < 2 || model.length > 80) {
+        return res.status(400).json({
+          error:
+            "Model must contain between 2 and 80 characters.",
+        });
+      }
+
+      updatedVehicle.model = model;
+    }
+
+    if (hasOwnProperty(body, "region")) {
+      if (typeof body.region !== "string") {
+        return res.status(400).json({
+          error: "Region must be a string.",
+        });
+      }
+
+      const region = normalizeVehicleText(body.region);
+
+      if (region.length < 2 || region.length > 80) {
+        return res.status(400).json({
+          error:
+            "Region must contain between 2 and 80 characters.",
+        });
+      }
+
+      updatedVehicle.region = region;
+    }
+
+    if (hasOwnProperty(body, "vehicle_type")) {
+      if (!isVehicleType(body.vehicle_type)) {
+        return res.status(400).json({
+          error: "A valid vehicle type is required.",
+        });
+      }
+
+      updatedVehicle.vehicle_type = body.vehicle_type;
+    }
+
+    if (hasOwnProperty(body, "fuel_type")) {
+      if (!isFuelType(body.fuel_type)) {
+        return res.status(400).json({
+          error: "A valid fuel type is required.",
+        });
+      }
+
+      updatedVehicle.fuel_type = body.fuel_type;
+    }
+
+    if (
+      hasOwnProperty(
+        body,
+        "maximum_load_capacity",
+      )
+    ) {
+      const maximumLoadCapacity =
+        parseFiniteNumber(
+          body.maximum_load_capacity,
+        );
+
+      if (
+        maximumLoadCapacity === null ||
+        maximumLoadCapacity <= 0
+      ) {
+        return res.status(400).json({
+          error:
+            "Maximum load capacity must be greater than zero.",
+        });
+      }
+
+      updatedVehicle.maximum_load_capacity =
+        maximumLoadCapacity;
+    }
+
+    if (hasOwnProperty(body, "odometer")) {
+      const odometer = parseFiniteNumber(
+        body.odometer,
+      );
+
+      if (odometer === null || odometer < 0) {
+        return res.status(400).json({
+          error: "Odometer must be zero or greater.",
+        });
+      }
+
+      if (odometer < vehicle.odometer) {
+        return res.status(409).json({
+          error: `Odometer cannot be reduced below the current reading of ${vehicle.odometer}.`,
+        });
+      }
+
+      updatedVehicle.odometer = odometer;
+    }
+
+    if (
+      hasOwnProperty(body, "acquisition_cost")
+    ) {
+      const acquisitionCost = parseFiniteNumber(
+        body.acquisition_cost,
+      );
+
+      if (
+        acquisitionCost === null ||
+        acquisitionCost < 0
+      ) {
+        return res.status(400).json({
+          error:
+            "Acquisition cost must be zero or greater.",
+        });
+      }
+
+      updatedVehicle.acquisition_cost = acquisitionCost;
+    }
+
+    if (
+      hasOwnProperty(body, "manufacture_year")
+    ) {
+      const manufactureYear = parseFiniteNumber(
+        body.manufacture_year,
+      );
+      const maximumManufactureYear =
+        new Date().getFullYear() + 1;
+
+      if (
+        manufactureYear === null ||
+        !Number.isInteger(manufactureYear) ||
+        manufactureYear < MIN_MANUFACTURE_YEAR ||
+        manufactureYear > maximumManufactureYear
+      ) {
+        return res.status(400).json({
+          error: `Manufacture year must be between ${MIN_MANUFACTURE_YEAR} and ${maximumManufactureYear}.`,
+        });
+      }
+
+      updatedVehicle.manufacture_year = manufactureYear;
+    }
+
+    updatedVehicle.updated_at =
+      new Date().toISOString();
+    db.vehicles[vehicleIndex] = updatedVehicle;
+
+    try {
+      db.save();
+    } catch (error) {
+      db.vehicles[vehicleIndex] = vehicle;
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Updated vehicle ${updatedVehicle.vehicle_name} (${updatedVehicle.registration_number})`,
+      "VEHICLE",
+      updatedVehicle.id,
+    );
+
+    return res.json(updatedVehicle);
+  },
+);
+
+apiRouter.patch(
+  "/vehicles/:id/retire",
+  authenticateJWT,
+  requireRole([
+    UserRole.ADMIN,
+    UserRole.FLEET_MANAGER,
+  ]),
+  (req: AuthenticatedRequest, res) => {
+    const vehicle = db.vehicles.find(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
+
+    if (!vehicle) {
+      return res.status(404).json({
+        error: "Vehicle not found.",
+      });
+    }
+
+    if (vehicle.status === VehicleStatus.RETIRED) {
+      return res.json(vehicle);
+    }
+
+    const hasActiveTrip = db.trips.some(
+      (trip) =>
+        trip.vehicle_id === vehicle.id &&
+        trip.status === TripStatus.DISPATCHED,
+    );
+    const hasActiveMaintenance =
+      db.maintenance_logs.some(
+        (log) =>
+          log.vehicle_id === vehicle.id &&
+          [
+            MaintenanceStatus.OPEN,
+            MaintenanceStatus.IN_PROGRESS,
+          ].includes(log.status),
+      );
+
+    if (
+      vehicle.status === VehicleStatus.ON_TRIP ||
+      hasActiveTrip
+    ) {
+      return res.status(409).json({
+        error:
+          "A vehicle on an active trip cannot be retired.",
+      });
+    }
+
+    if (
+      vehicle.status === VehicleStatus.IN_SHOP ||
+      hasActiveMaintenance
+    ) {
+      return res.status(409).json({
+        error:
+          "Complete or cancel active maintenance before retiring this vehicle.",
+      });
+    }
+
+    const oldStatus = vehicle.status;
+    vehicle.status = VehicleStatus.RETIRED;
+    vehicle.updated_at = new Date().toISOString();
+    db.save();
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Retired vehicle ${vehicle.vehicle_name} (${vehicle.registration_number})`,
+      "VEHICLE",
+      vehicle.id,
+      oldStatus,
+      VehicleStatus.RETIRED,
+    );
+
+    return res.json(vehicle);
+  },
+);
+
+apiRouter.delete(
+  "/vehicles/:id",
+  authenticateJWT,
+  requireRole([UserRole.ADMIN]),
+  (req: AuthenticatedRequest, res) => {
+    const index = db.vehicles.findIndex(
+      (vehicle) => vehicle.id === req.params.id,
+    );
+
+    if (index === -1) {
+      return res.status(404).json({
+        error: "Vehicle not found.",
+      });
+    }
+
+    const vehicle = db.vehicles[index];
+
+    if (
+      vehicle.status === VehicleStatus.ON_TRIP ||
+      vehicle.status === VehicleStatus.IN_SHOP
+    ) {
+      return res.status(409).json({
+        error:
+          "A vehicle that is on a trip or in maintenance cannot be deleted.",
+      });
+    }
+
+    const references = {
+      trips: db.trips.filter(
+        (trip) => trip.vehicle_id === vehicle.id,
+      ).length,
+      maintenance: db.maintenance_logs.filter(
+        (log) => log.vehicle_id === vehicle.id,
+      ).length,
+      fuel_logs: db.fuel_logs.filter(
+        (fuelLog) =>
+          fuelLog.vehicle_id === vehicle.id,
+      ).length,
+      expenses: db.expenses.filter(
+        (expense) =>
+          expense.vehicle_id === vehicle.id,
+      ).length,
+    };
+
+    const referenceCount = Object.values(
+      references,
+    ).reduce((sum, count) => sum + count, 0);
+
+    if (referenceCount > 0) {
+      return res.status(409).json({
+        error:
+          "This vehicle has operational history and cannot be deleted. Retire it instead.",
+        references,
+      });
+    }
+
+    db.vehicles.splice(index, 1);
+
+    try {
+      db.save();
+    } catch (error) {
+      db.vehicles.splice(index, 0, vehicle);
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Deleted vehicle ${vehicle.vehicle_name} (${vehicle.registration_number})`,
+      "VEHICLE",
+      vehicle.id,
+    );
+
+    return res.json({
+      success: true,
+    });
+  },
+);
 
 // ============================================================================
 // 4. DRIVER MODULE ENDPOINTS
