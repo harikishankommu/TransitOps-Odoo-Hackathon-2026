@@ -21,6 +21,7 @@ import { DriverDetailsPage } from "./pages/DriverDetailsPage.js";
 import { DriversPage } from "./pages/DriversPage.js";
 import { FuelExpensesPage } from "./pages/FuelExpensesPage.js";
 import { LoginPage } from "./pages/LoginPage.js";
+import { MaintenanceDetailsPage } from "./pages/MaintenanceDetailsPage.js";
 import { MaintenancePage } from "./pages/MaintenancePage.js";
 import { NotificationsPage } from "./pages/NotificationsPage.js";
 import { ReportsPage } from "./pages/ReportsPage.js";
@@ -98,6 +99,8 @@ const AppContent: React.FC = () => {
     useState<string | null>(null);
   const [selectedTripId, setSelectedTripId] =
     useState<string | null>(null);
+  const [selectedMaintenanceId, setSelectedMaintenanceId] =
+    useState<string | null>(null);
 
   const syncBadgeCount = useCallback(async () => {
     if (!isAuthenticated) {
@@ -143,6 +146,7 @@ const AppContent: React.FC = () => {
     setSelectedVehicleId(null);
     setSelectedDriverId(null);
     setSelectedTripId(null);
+    setSelectedMaintenanceId(null);
   }, [currentTab, user]);
 
   if (loading) {
@@ -176,6 +180,7 @@ const AppContent: React.FC = () => {
     setSelectedVehicleId(null);
     setSelectedDriverId(null);
     setSelectedTripId(null);
+    setSelectedMaintenanceId(null);
   };
 
   const handleTabChange = (tab: AppTab): void => {
@@ -197,6 +202,7 @@ const AppContent: React.FC = () => {
     setSelectedVehicleId(vehicleId);
     setSelectedDriverId(null);
     setSelectedTripId(null);
+    setSelectedMaintenanceId(null);
     setCurrentTab("vehicles");
   };
 
@@ -210,6 +216,7 @@ const AppContent: React.FC = () => {
     setSelectedDriverId(driverId);
     setSelectedVehicleId(null);
     setSelectedTripId(null);
+    setSelectedMaintenanceId(null);
     setCurrentTab("drivers");
   };
 
@@ -223,7 +230,22 @@ const AppContent: React.FC = () => {
     setSelectedTripId(tripId);
     setSelectedVehicleId(null);
     setSelectedDriverId(null);
+    setSelectedMaintenanceId(null);
     setCurrentTab("trips");
+  };
+
+  const handleViewMaintenanceDetails = (
+    maintenanceId: string,
+  ): void => {
+    if (!canAccessTab(user.role, "maintenance")) {
+      return;
+    }
+
+    setSelectedMaintenanceId(maintenanceId);
+    setSelectedVehicleId(null);
+    setSelectedDriverId(null);
+    setSelectedTripId(null);
+    setCurrentTab("maintenance");
   };
 
   const renderTabContent = (): React.ReactNode => {
@@ -288,11 +310,30 @@ const AppContent: React.FC = () => {
       );
     }
 
+    if (currentTab === "maintenance") {
+      if (selectedMaintenanceId) {
+        return (
+          <MaintenanceDetailsPage
+            maintenanceId={selectedMaintenanceId}
+            onBack={() =>
+              setSelectedMaintenanceId(null)
+            }
+          />
+        );
+      }
+
+      return (
+        <MaintenancePage
+          onViewDetails={
+            handleViewMaintenanceDetails
+          }
+        />
+      );
+    }
+
     switch (currentTab) {
       case "dashboard":
         return <DashboardPage />;
-      case "maintenance":
-        return <MaintenancePage />;
       case "fuel-expenses":
         return <FuelExpensesPage />;
       case "reports":
@@ -362,5 +403,3 @@ export default function App() {
     </AuthProvider>
   );
 }
-
-
