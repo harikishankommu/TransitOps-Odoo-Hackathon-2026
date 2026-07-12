@@ -1,52 +1,107 @@
-import express from "express";
-import path from "path";
+import "dotenv/config";
+
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import path from "node:path";
 import { createServer as createViteServer } from "vite";
+
 import { apiRouter } from "./src/server/routers/api.js";
+
+const DEFAULT_PORT = 3000;
+
+function resolvePort(): number {
+  const configuredPort = Number(process.env.PORT ?? DEFAULT_PORT);
+
+  return Number.isInteger(configuredPort) && configuredPort > 0
+    ? configuredPort
+    : DEFAULT_PORT;
+}
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const port = resolvePort();
+  const isProduction = process.env.NODE_ENV === "production";
 
-  // Enable JSON request body parsing
-  app.use(express.json());
+  // Avoid exposing Express in response headers.
+  app.disable("x-powered-by");
 
-  // Mount API routes
-  app.use("/api", apiRouter);
+  // Parse JSON requests with a reasonable size limit.
+  app.use(express.json({ limit: "1mb" }));
 
-  // Health check endpoint
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", service: "TransitOps API Engine", timestamp: new Date().toISOString() });
+  app.get("/api/health", (_req, res) => {
+    res.json({
+      status: "ok",
+      service: "TransitOps API",
+      environment: isProduction ? "production" : "development",
+      timestamp: new Date().toISOString(),
+    });
   });
 
-  // Vite development middleware vs Static Production files
-  if (process.env.NODE_ENV !== "production") {
-    console.log("Starting server in DEVELOPMENT mode with Vite dev middleware...");
+  app.use("/api", apiRouter);
+
+  // API-specific 404 response.
+  app.use("/api", (_req, res) => {
+    res.status(404).json({
+      error: "API endpoint not found.",
+    });
+  });
+
+  if (!isProduction) {
+    console.log("Starting TransitOps in development mode...");
+
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+      },
       appType: "spa",
     });
+
     app.use(vite.middlewares);
   } else {
-    console.log("Starting server in PRODUCTION mode...");
+    console.log("Starting TransitOps in production mode...");
+
     const distPath = path.join(process.cwd(), "dist");
-    
-    // Serve static frontend assets
+
     app.use(express.static(distPath));
-    
-    // SPA Fallback: Send index.html for any other routing path
-    app.get("*", (req, res) => {
+
+    // React single-page application fallback.
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`===========================================================`);
-    console.log(` TransitOps running on: http://localhost:${PORT}`);
-    console.log(` Development app is live in the preview pane.`);
-    console.log(`===========================================================`);
+  // Final unhandled error handler.
+  app.use(
+    (
+      error: unknown,
+      _req: Request,
+      res: Response,
+      _next: NextFunction,
+    ) => {
+      console.error("Unhandled server error:", error);
+
+      res.status(500).json({
+        error: "An unexpected server error occurred.",
+      });
+    },
+  );
+
+  const server = app.listen(port, "0.0.0.0", () => {
+    console.log("===========================================================");
+    console.log(` TransitOps running on: http://localhost:${port}`);
+    console.log(` Mode: ${isProduction ? "production" : "development"}`);
+    console.log("===========================================================");
+  });
+
+  server.on("error", (error) => {
+    console.error("TransitOps server failed:", error);
   });
 }
 
-startServer().catch(err => {
-  console.error("Failed to start full-stack server:", err);
+startServer().catch((error) => {
+  console.error("Failed to start TransitOps:", error);
+  process.exitCode = 1;
 });
