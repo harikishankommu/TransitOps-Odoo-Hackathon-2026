@@ -4423,276 +4423,1703 @@ apiRouter.delete(
 // 7. FUEL LOGS & EXPENSE MODULE ENDPOINTS
 // ============================================================================
 
-// Fuel Logs CRUD
+type FinancialRecordSource =
+  | "MANUAL"
+  | "TRIP_COMPLETION"
+  | "MAINTENANCE_COMPLETION"
+  | "LEGACY_FUEL_MIRROR";
+
+type FuelSortField =
+  | "created_at"
+  | "fuel_date"
+  | "fuel_litres"
+  | "fuel_cost"
+  | "price_per_litre"
+  | "odometer_reading"
+  | "receipt_number";
+
+type ExpenseSortField =
+  | "created_at"
+  | "expense_date"
+  | "amount"
+  | "expense_type"
+  | "receipt_number";
+
+const FUEL_SORT_FIELDS = new Set<FuelSortField>([
+  "created_at",
+  "fuel_date",
+  "fuel_litres",
+  "fuel_cost",
+  "price_per_litre",
+  "odometer_reading",
+  "receipt_number",
+]);
+
+const EXPENSE_SORT_FIELDS = new Set<ExpenseSortField>([
+  "created_at",
+  "expense_date",
+  "amount",
+  "expense_type",
+  "receipt_number",
+]);
+
+function normalizeFinancialText(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function normalizeReceiptNumber(value: string): string {
+  return value.trim().replace(/\s+/g, "").toUpperCase();
+}
+
+function getFuelSource(log: FuelLog): FinancialRecordSource {
+  const storedSource = (
+    log as FuelLog & {
+      source?: FinancialRecordSource;
+    }
+  ).source;
+
+  if (storedSource) {
+    return storedSource;
+  }
+
+  if (
+    log.trip_id &&
+    /^AUTO-/i.test(log.receipt_number)
+  ) {
+    return "TRIP_COMPLETION";
+  }
+
+  return "MANUAL";
+}
+
+function getExpenseSource(
+  expense: Expense,
+): FinancialRecordSource {
+  const storedSource = (
+    expense as Expense & {
+      source?: FinancialRecordSource;
+    }
+  ).source;
+
+  if (storedSource) {
+    return storedSource;
+  }
+
+  if (
+    /^MNT-/i.test(expense.receipt_number) ||
+    /^Maintenance completed:/i.test(
+      expense.description,
+    )
+  ) {
+    return "MAINTENANCE_COMPLETION";
+  }
+
+  if (/^Fuel Purchase:/i.test(expense.description)) {
+    return "LEGACY_FUEL_MIRROR";
+  }
+
+  return "MANUAL";
+}
+
+function getVehicleForFinancialRecord(
+  vehicleId: string | undefined,
+) {
+  return vehicleId
+    ? db.vehicles.find(
+        (vehicle) => vehicle.id === vehicleId,
+      )
+    : undefined;
+}
+
+function getTripForFinancialRecord(
+  tripId: string | undefined,
+) {
+  return tripId
+    ? db.trips.find((trip) => trip.id === tripId)
+    : undefined;
+}
+
+function validateFinancialTripLink(
+  tripId: string | undefined,
+  vehicleId: string | undefined,
+):
+  | {
+      trip: Trip | undefined;
+      resolvedVehicleId: string | undefined;
+    }
+  | { error: string; status: number } {
+  if (!tripId) {
+    return {
+      trip: undefined,
+      resolvedVehicleId: vehicleId,
+    };
+  }
+
+  const trip = getTripForFinancialRecord(tripId);
+
+  if (!trip) {
+    return {
+      error: "The selected trip was not found.",
+      status: 400,
+    };
+  }
+
+  if (
+    ![
+      TripStatus.DISPATCHED,
+      TripStatus.COMPLETED,
+    ].includes(trip.status)
+  ) {
+    return {
+      error:
+        "Financial records can only be linked to dispatched or completed trips.",
+      status: 409,
+    };
+  }
+
+  if (vehicleId && trip.vehicle_id !== vehicleId) {
+    return {
+      error:
+        "The selected trip belongs to a different vehicle.",
+      status: 409,
+    };
+  }
+
+  return {
+    trip,
+    resolvedVehicleId: trip.vehicle_id,
+  };
+}
+
+function compareFinancialValues(
+  firstValue: unknown,
+  secondValue: unknown,
+  order: 1 | -1,
+): number {
+  if (
+    typeof firstValue === "number" &&
+    typeof secondValue === "number"
+  ) {
+    return (firstValue - secondValue) * order;
+  }
+
+  return (
+    String(firstValue ?? "").localeCompare(
+      String(secondValue ?? ""),
+      undefined,
+      {
+        numeric: true,
+        sensitivity: "base",
+      },
+    ) * order
+  );
+}
+
+function serializeFuelLog(log: FuelLog) {
+  const vehicle = getVehicleForFinancialRecord(
+    log.vehicle_id,
+  );
+  const trip = getTripForFinancialRecord(log.trip_id);
+  const source = getFuelSource(log);
+
+  return {
+    ...log,
+    vehicle_name:
+      vehicle?.vehicle_name ?? "Unknown Vehicle",
+    registration_number:
+      vehicle?.registration_number ?? "Unknown",
+    vehicle_odometer: vehicle?.odometer ?? null,
+    trip_code: trip?.trip_code ?? null,
+    source,
+    is_protected: source !== "MANUAL",
+  };
+}
+
+function serializeExpense(expense: Expense) {
+  const vehicle = getVehicleForFinancialRecord(
+    expense.vehicle_id,
+  );
+  const trip = getTripForFinancialRecord(
+    expense.trip_id,
+  );
+  const source = getExpenseSource(expense);
+
+  return {
+    ...expense,
+    vehicle_name:
+      vehicle?.vehicle_name ??
+      "General Operational Expense",
+    registration_number:
+      vehicle?.registration_number ?? "N/A",
+    trip_code: trip?.trip_code ?? null,
+    source,
+    is_protected: source !== "MANUAL",
+  };
+}
+
+apiRouter.get(
+  "/financial/options",
+  authenticateJWT,
+  requireRole(FINANCIAL_ROLES),
+  (_req, res) => {
+    const vehicles = [...db.vehicles]
+      .sort((first, second) =>
+        first.registration_number.localeCompare(
+          second.registration_number,
+          undefined,
+          {
+            numeric: true,
+            sensitivity: "base",
+          },
+        ),
+      )
+      .map((vehicle) => ({
+        id: vehicle.id,
+        vehicle_name: vehicle.vehicle_name,
+        registration_number:
+          vehicle.registration_number,
+        odometer: vehicle.odometer,
+        status: vehicle.status,
+      }));
+
+    const trips = db.trips
+      .filter((trip) =>
+        [
+          TripStatus.DISPATCHED,
+          TripStatus.COMPLETED,
+        ].includes(trip.status),
+      )
+      .sort((first, second) =>
+        second.created_at.localeCompare(
+          first.created_at,
+        ),
+      )
+      .map((trip) => ({
+        id: trip.id,
+        trip_code: trip.trip_code,
+        vehicle_id: trip.vehicle_id,
+        source: trip.source,
+        destination: trip.destination,
+        status: trip.status,
+      }));
+
+    return res.json({
+      vehicles,
+      trips,
+      expense_types: Object.values(ExpenseType),
+    });
+  },
+);
+
 apiRouter.get(
   ["/fuel-logs", "/fuel"],
   authenticateJWT,
   requireRole(FINANCIAL_ROLES),
   (req, res) => {
-  const list = [...db.fuel_logs];
-  // Denormalize vehicles
-  let result = list.map(f => {
-    const vehicle = db.vehicles.find(v => v.id === f.vehicle_id);
-    const trip = f.trip_id ? db.trips.find(t => t.id === f.trip_id) : null;
-    return {
-      ...f,
-      vehicle_reg: vehicle ? vehicle.registration_number : "Unknown",
-      registration_number: vehicle ? vehicle.registration_number : "Unknown",
-      vehicle_name: vehicle ? vehicle.vehicle_name : "Unknown",
-      trip_code: trip ? trip.trip_code : undefined,
-      bill_number: f.receipt_number, // alias for frontend table
-      refill_date: f.fuel_date // alias for frontend table
-    };
-  });
-
-  const search = req.query.search ? String(req.query.search).toLowerCase() : "";
-  if (search) {
-    result = result.filter(item => 
-      item.bill_number?.toLowerCase().includes(search) ||
-      item.receipt_number?.toLowerCase().includes(search) ||
-      item.vehicle_name?.toLowerCase().includes(search) ||
-      item.vehicle_reg?.toLowerCase().includes(search) ||
-      (item.notes && item.notes.toLowerCase().includes(search))
+    const search = getSingleQueryValue(
+      req.query.search,
+    ).toLowerCase();
+    const vehicleId = getSingleQueryValue(
+      req.query.vehicle_id,
     );
-  }
+    const dateFrom = getSingleQueryValue(
+      req.query.date_from,
+    );
+    const dateTo = getSingleQueryValue(
+      req.query.date_to,
+    );
+    const requestedSortField =
+      getSingleQueryValue(req.query.sort_by) ||
+      "fuel_date";
+    const requestedSortOrder =
+      getSingleQueryValue(req.query.sort_order) ||
+      "desc";
 
-  res.json(result);
-});
+    if (
+      dateFrom &&
+      !isIsoDate(dateFrom)
+    ) {
+      return res.status(400).json({
+        error: "Fuel start date is invalid.",
+      });
+    }
+
+    if (
+      dateTo &&
+      !isIsoDate(dateTo)
+    ) {
+      return res.status(400).json({
+        error: "Fuel end date is invalid.",
+      });
+    }
+
+    if (dateFrom && dateTo && dateFrom > dateTo) {
+      return res.status(400).json({
+        error:
+          "Fuel start date cannot be after the end date.",
+      });
+    }
+
+    if (
+      !FUEL_SORT_FIELDS.has(
+        requestedSortField as FuelSortField,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Invalid fuel sort field.",
+      });
+    }
+
+    if (
+      requestedSortOrder !== "asc" &&
+      requestedSortOrder !== "desc"
+    ) {
+      return res.status(400).json({
+        error:
+          "Fuel sort order must be asc or desc.",
+      });
+    }
+
+    let list = db.fuel_logs.map(serializeFuelLog);
+
+    if (search) {
+      list = list.filter((log) =>
+        [
+          log.vehicle_name,
+          log.registration_number,
+          log.receipt_number,
+          log.fuel_station,
+          log.trip_code ?? "",
+          log.notes ?? "",
+        ].some((value) =>
+          value.toLowerCase().includes(search),
+        ),
+      );
+    }
+
+    if (vehicleId) {
+      list = list.filter(
+        (log) => log.vehicle_id === vehicleId,
+      );
+    }
+
+    if (dateFrom) {
+      list = list.filter(
+        (log) => log.fuel_date >= dateFrom,
+      );
+    }
+
+    if (dateTo) {
+      list = list.filter(
+        (log) => log.fuel_date <= dateTo,
+      );
+    }
+
+    const sortField =
+      requestedSortField as FuelSortField;
+    const sortOrder: 1 | -1 =
+      requestedSortOrder === "asc" ? 1 : -1;
+
+    list.sort((first, second) =>
+      compareFinancialValues(
+        first[sortField],
+        second[sortField],
+        sortOrder,
+      ),
+    );
+
+    const summary = {
+      total_litres: list.reduce(
+        (sum, log) => sum + log.fuel_litres,
+        0,
+      ),
+      total_cost: list.reduce(
+        (sum, log) => sum + log.fuel_cost,
+        0,
+      ),
+      average_price:
+        list.reduce(
+          (sum, log) => sum + log.fuel_litres,
+          0,
+        ) > 0
+          ? list.reduce(
+              (sum, log) => sum + log.fuel_cost,
+              0,
+            ) /
+            list.reduce(
+              (sum, log) => sum + log.fuel_litres,
+              0,
+            )
+          : 0,
+    };
+
+    const pageSize = parsePositiveInteger(
+      req.query.page_size,
+      10,
+      100,
+    );
+    const requestedPage = parsePositiveInteger(
+      req.query.page,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const total = list.length;
+    const totalPages = Math.max(
+      1,
+      Math.ceil(total / pageSize),
+    );
+    const page = Math.min(
+      requestedPage,
+      totalPages,
+    );
+    const startIndex = (page - 1) * pageSize;
+
+    return res.json({
+      data: list.slice(
+        startIndex,
+        startIndex + pageSize,
+      ),
+      total,
+      page,
+      page_size: pageSize,
+      total_pages: totalPages,
+      summary,
+    });
+  },
+);
 
 apiRouter.post(
   ["/fuel-logs", "/fuel"],
   authenticateJWT,
   requireRole(FINANCIAL_ROLES),
   (req: AuthenticatedRequest, res) => {
-  const {
-    vehicle_id,
-    trip_id,
-    fuel_litres,
-    price_per_litre,
-    odometer_reading,
-    notes
-  } = req.body;
+    const body = req.body ?? {};
 
-  // support both frontend names and backend schema names
-  const bill_number = req.body.bill_number || req.body.receipt_number;
-  const refill_date = req.body.refill_date || req.body.fuel_date;
-  
-  // calculate fuel_cost if not specified
-  const cost = req.body.fuel_cost !== undefined ? Number(req.body.fuel_cost) : (Number(fuel_litres) * Number(price_per_litre));
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error: "A valid fuel payload is required.",
+      });
+    }
 
-  if (!vehicle_id || !fuel_litres || !cost || !odometer_reading || !refill_date || !bill_number) {
-    return res.status(400).json({ error: "Missing required fuel log fields." });
-  }
+    const requestedVehicleId =
+      typeof body.vehicle_id === "string"
+        ? body.vehicle_id.trim()
+        : "";
+    const requestedTripId =
+      typeof body.trip_id === "string" &&
+      body.trip_id.trim()
+        ? body.trip_id.trim()
+        : undefined;
+    const tripValidation =
+      validateFinancialTripLink(
+        requestedTripId,
+        requestedVehicleId || undefined,
+      );
 
-  const litres = Number(fuel_litres);
-  const odom = Number(odometer_reading);
+    if ("error" in tripValidation) {
+      return res
+        .status(tripValidation.status)
+        .json({ error: tripValidation.error });
+    }
 
-  if (litres <= 0) return res.status(400).json({ error: "Fuel litres must be greater than zero." });
-  if (cost < 0) return res.status(400).json({ error: "Fuel cost cannot be negative." });
+    const vehicleId =
+      tripValidation.resolvedVehicleId;
 
-  const vehicle = db.vehicles.find(v => v.id === vehicle_id);
-  if (!vehicle) return res.status(400).json({ error: "Vehicle not found." });
+    if (!vehicleId) {
+      return res.status(400).json({
+        error: "A vehicle is required.",
+      });
+    }
 
-  if (odom < vehicle.odometer) {
-    return res.status(400).json({ error: `Odometer reading cannot be below the vehicle's current odometer (${vehicle.odometer}).` });
-  }
+    const vehicle =
+      getVehicleForFinancialRecord(vehicleId);
 
-  const calculated_price_per_litre = price_per_litre ? Number(price_per_litre) : Number((cost / litres).toFixed(2));
+    if (!vehicle) {
+      return res.status(400).json({
+        error: "The selected vehicle was not found.",
+      });
+    }
 
-  const fLog: FuelLog = {
-    id: "fl_" + Math.random().toString(36).substr(2, 9),
-    vehicle_id,
-    trip_id: trip_id || undefined,
-    fuel_litres: litres,
-    fuel_cost: cost,
-    price_per_litre: calculated_price_per_litre,
-    odometer_reading: odom,
-    fuel_date: refill_date,
-    fuel_station: req.body.fuel_station || "Generic Station",
-    receipt_number: bill_number,
-    notes,
-    created_by: req.user!.id,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
+    if (vehicle.status === VehicleStatus.RETIRED) {
+      return res.status(409).json({
+        error:
+          "Fuel cannot be logged for a retired vehicle.",
+      });
+    }
 
-  db.fuel_logs.unshift(fLog);
+    const fuelLitres = parseFiniteNumber(
+      body.fuel_litres,
+    );
+    const pricePerLitre = parseFiniteNumber(
+      body.price_per_litre,
+    );
+    const suppliedFuelCost = parseFiniteNumber(
+      body.fuel_cost,
+    );
+    const odometerReading = parseFiniteNumber(
+      body.odometer_reading,
+    );
+    const fuelDate =
+      typeof body.fuel_date === "string"
+        ? body.fuel_date.trim()
+        : typeof body.refill_date === "string"
+          ? body.refill_date.trim()
+          : "";
+    const fuelStation =
+      typeof body.fuel_station === "string"
+        ? normalizeFinancialText(
+            body.fuel_station,
+          )
+        : "";
+    const receiptNumber =
+      typeof body.receipt_number === "string"
+        ? normalizeReceiptNumber(
+            body.receipt_number,
+          )
+        : typeof body.bill_number === "string"
+          ? normalizeReceiptNumber(
+              body.bill_number,
+            )
+          : "";
+    const notes =
+      typeof body.notes === "string"
+        ? normalizeFinancialText(body.notes)
+        : "";
 
-  // Update vehicle odometer
-  vehicle.odometer = odom;
-  vehicle.updated_at = new Date().toISOString();
+    if (
+      fuelLitres === null ||
+      fuelLitres <= 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Fuel litres must be greater than zero.",
+      });
+    }
 
-  // Also auto-record a corresponding fuel Expense
-  const fuelExpense: Expense = {
-    id: "ex_" + Math.random().toString(36).substr(2, 9),
-    vehicle_id: vehicle.id,
-    trip_id: trip_id || undefined,
-    expense_type: ExpenseType.OTHER,
-    amount: cost,
-    expense_date: refill_date,
-    description: `Fuel Purchase: ${litres}L @ ${calculated_price_per_litre}/L at ${fLog.fuel_station}`,
-    receipt_number: bill_number,
-    created_by: req.user!.id,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
-  db.expenses.unshift(fuelExpense);
+    if (
+      pricePerLitre === null ||
+      pricePerLitre <= 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Price per litre must be greater than zero.",
+      });
+    }
 
-  db.save();
+    const calculatedFuelCost =
+      fuelLitres * pricePerLitre;
+    const fuelCost =
+      suppliedFuelCost === null
+        ? calculatedFuelCost
+        : suppliedFuelCost;
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Logged ${litres} litres fuel for vehicle ${vehicle.registration_number}`,
-    "FUEL_LOG",
-    fLog.id
-  );
+    if (
+      fuelCost <= 0 ||
+      Math.abs(
+        fuelCost - calculatedFuelCost,
+      ) > 1
+    ) {
+      return res.status(400).json({
+        error:
+          "Fuel cost must match litres multiplied by price per litre.",
+      });
+    }
 
-  res.status(201).json({
-    ...fLog,
-    bill_number: fLog.receipt_number,
-    refill_date: fLog.fuel_date
-  });
-});
+    if (
+      odometerReading === null ||
+      odometerReading < 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Odometer reading must be zero or greater.",
+      });
+    }
 
-apiRouter.delete("/fuel-logs/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
-  const index = db.fuel_logs.findIndex(f => f.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Fuel log not found." });
+    const maximumKnownFuelOdometer =
+      db.fuel_logs
+        .filter(
+          (log) => log.vehicle_id === vehicle.id,
+        )
+        .reduce(
+          (maximum, log) =>
+            Math.max(
+              maximum,
+              log.odometer_reading,
+            ),
+          0,
+        );
+    const minimumOdometer = Math.max(
+      vehicle.odometer,
+      maximumKnownFuelOdometer,
+    );
 
-  const log = db.fuel_logs[index];
-  db.fuel_logs.splice(index, 1);
-  db.save();
+    if (odometerReading < minimumOdometer) {
+      return res.status(409).json({
+        error: `Odometer reading cannot be below the latest known reading of ${minimumOdometer}.`,
+      });
+    }
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Deleted fuel log entry ${log.receipt_number}`,
-    "FUEL_LOG",
-    log.id
-  );
+    if (
+      !isIsoDate(fuelDate) ||
+      fuelDate > getTodayDate()
+    ) {
+      return res.status(400).json({
+        error:
+          "Fuel date must be a valid date that is not in the future.",
+      });
+    }
 
-  res.json({ success: true });
-});
+    if (
+      fuelStation.length < 2 ||
+      fuelStation.length > 100
+    ) {
+      return res.status(400).json({
+        error:
+          "Fuel station must contain between 2 and 100 characters.",
+      });
+    }
 
-// Expenses CRUD
+    if (
+      receiptNumber.length < 2 ||
+      receiptNumber.length > 80
+    ) {
+      return res.status(400).json({
+        error:
+          "Receipt number must contain between 2 and 80 characters.",
+      });
+    }
+
+    const duplicateReceipt = db.fuel_logs.find(
+      (log) =>
+        normalizeReceiptNumber(
+          log.receipt_number,
+        ) === receiptNumber,
+    );
+
+    if (duplicateReceipt) {
+      return res.status(409).json({
+        error:
+          "A fuel record with this receipt number already exists.",
+      });
+    }
+
+    const duplicateEntry = db.fuel_logs.find(
+      (log) =>
+        log.vehicle_id === vehicle.id &&
+        log.fuel_date === fuelDate &&
+        log.odometer_reading ===
+          odometerReading &&
+        Math.abs(
+          log.fuel_litres - fuelLitres,
+        ) < 0.001 &&
+        Math.abs(log.fuel_cost - fuelCost) < 0.01,
+    );
+
+    if (duplicateEntry) {
+      return res.status(409).json({
+        error:
+          "A matching fuel entry already exists for this vehicle.",
+      });
+    }
+
+    const now = new Date().toISOString();
+    const fuelLog: FuelLog = {
+      id: db.generateId("fl"),
+      vehicle_id: vehicle.id,
+      trip_id: requestedTripId,
+      fuel_litres: fuelLitres,
+      fuel_cost: Number(fuelCost.toFixed(2)),
+      price_per_litre: Number(
+        pricePerLitre.toFixed(2),
+      ),
+      odometer_reading: odometerReading,
+      fuel_date: fuelDate,
+      fuel_station: fuelStation,
+      receipt_number: receiptNumber,
+      notes: notes || undefined,
+      created_by: req.user!.id,
+      created_at: now,
+      updated_at: now,
+    };
+
+    const oldVehicleOdometer = vehicle.odometer;
+    db.fuel_logs.unshift(fuelLog);
+
+    if (odometerReading > vehicle.odometer) {
+      vehicle.odometer = odometerReading;
+      vehicle.updated_at = now;
+    }
+
+    try {
+      db.save();
+    } catch (error) {
+      const index = db.fuel_logs.findIndex(
+        (log) => log.id === fuelLog.id,
+      );
+
+      if (index >= 0) {
+        db.fuel_logs.splice(index, 1);
+      }
+
+      vehicle.odometer = oldVehicleOdometer;
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Logged ${fuelLitres} litres of fuel for ${vehicle.registration_number}`,
+      "FUEL_LOG",
+      fuelLog.id,
+    );
+
+    return res
+      .status(201)
+      .json(serializeFuelLog(fuelLog));
+  },
+);
+
+apiRouter.put(
+  ["/fuel-logs/:id", "/fuel/:id"],
+  authenticateJWT,
+  requireRole(FINANCIAL_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const index = db.fuel_logs.findIndex(
+      (log) => log.id === req.params.id,
+    );
+
+    if (index === -1) {
+      return res.status(404).json({
+        error: "Fuel record not found.",
+      });
+    }
+
+    const original = db.fuel_logs[index];
+
+    if (getFuelSource(original) !== "MANUAL") {
+      return res.status(409).json({
+        error:
+          "Automatically generated fuel records cannot be edited.",
+      });
+    }
+
+    const body = req.body ?? {};
+
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error: "A valid fuel payload is required.",
+      });
+    }
+
+    const requestedVehicleId =
+      typeof body.vehicle_id === "string"
+        ? body.vehicle_id.trim()
+        : original.vehicle_id;
+    const requestedTripId =
+      body.trip_id === null ||
+      body.trip_id === ""
+        ? undefined
+        : typeof body.trip_id === "string"
+          ? body.trip_id.trim()
+          : original.trip_id;
+    const tripValidation =
+      validateFinancialTripLink(
+        requestedTripId,
+        requestedVehicleId,
+      );
+
+    if ("error" in tripValidation) {
+      return res
+        .status(tripValidation.status)
+        .json({ error: tripValidation.error });
+    }
+
+    const vehicleId =
+      tripValidation.resolvedVehicleId;
+
+    if (!vehicleId) {
+      return res.status(400).json({
+        error: "A vehicle is required.",
+      });
+    }
+
+    const vehicle =
+      getVehicleForFinancialRecord(vehicleId);
+
+    if (!vehicle) {
+      return res.status(400).json({
+        error: "The selected vehicle was not found.",
+      });
+    }
+
+    if (vehicle.status === VehicleStatus.RETIRED) {
+      return res.status(409).json({
+        error:
+          "Fuel cannot be assigned to a retired vehicle.",
+      });
+    }
+
+    const fuelLitres =
+      hasOwnProperty(body, "fuel_litres")
+        ? parseFiniteNumber(body.fuel_litres)
+        : original.fuel_litres;
+    const pricePerLitre =
+      hasOwnProperty(body, "price_per_litre")
+        ? parseFiniteNumber(
+            body.price_per_litre,
+          )
+        : original.price_per_litre;
+    const odometerReading =
+      hasOwnProperty(body, "odometer_reading")
+        ? parseFiniteNumber(
+            body.odometer_reading,
+          )
+        : original.odometer_reading;
+    const fuelDate =
+      typeof body.fuel_date === "string"
+        ? body.fuel_date.trim()
+        : original.fuel_date;
+    const fuelStation =
+      typeof body.fuel_station === "string"
+        ? normalizeFinancialText(
+            body.fuel_station,
+          )
+        : original.fuel_station;
+    const receiptNumber =
+      typeof body.receipt_number === "string"
+        ? normalizeReceiptNumber(
+            body.receipt_number,
+          )
+        : original.receipt_number;
+    const notes =
+      body.notes === null ||
+      body.notes === ""
+        ? undefined
+        : typeof body.notes === "string"
+          ? normalizeFinancialText(body.notes)
+          : original.notes;
+
+    if (
+      fuelLitres === null ||
+      fuelLitres <= 0 ||
+      pricePerLitre === null ||
+      pricePerLitre <= 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Fuel litres and price per litre must be greater than zero.",
+      });
+    }
+
+    if (
+      odometerReading === null ||
+      odometerReading < 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Odometer reading must be zero or greater.",
+      });
+    }
+
+    const odometerChanged =
+      odometerReading !==
+        original.odometer_reading ||
+      vehicle.id !== original.vehicle_id;
+
+    if (odometerChanged) {
+      const maximumOtherFuelOdometer =
+        db.fuel_logs
+          .filter(
+            (log) =>
+              log.id !== original.id &&
+              log.vehicle_id === vehicle.id,
+          )
+          .reduce(
+            (maximum, log) =>
+              Math.max(
+                maximum,
+                log.odometer_reading,
+              ),
+            0,
+          );
+      const minimumOdometer = Math.max(
+        vehicle.odometer,
+        maximumOtherFuelOdometer,
+      );
+
+      if (odometerReading < minimumOdometer) {
+        return res.status(409).json({
+          error: `Odometer reading cannot be below the latest known reading of ${minimumOdometer}.`,
+        });
+      }
+    }
+
+    if (
+      !isIsoDate(fuelDate) ||
+      fuelDate > getTodayDate()
+    ) {
+      return res.status(400).json({
+        error:
+          "Fuel date must be a valid date that is not in the future.",
+      });
+    }
+
+    if (
+      fuelStation.length < 2 ||
+      fuelStation.length > 100 ||
+      receiptNumber.length < 2 ||
+      receiptNumber.length > 80
+    ) {
+      return res.status(400).json({
+        error:
+          "Fuel station and receipt number are invalid.",
+      });
+    }
+
+    const duplicateReceipt = db.fuel_logs.find(
+      (log) =>
+        log.id !== original.id &&
+        normalizeReceiptNumber(
+          log.receipt_number,
+        ) ===
+          normalizeReceiptNumber(receiptNumber),
+    );
+
+    if (duplicateReceipt) {
+      return res.status(409).json({
+        error:
+          "A fuel record with this receipt number already exists.",
+      });
+    }
+
+    const fuelCost = Number(
+      (fuelLitres * pricePerLitre).toFixed(2),
+    );
+    const updated: FuelLog = {
+      ...original,
+      vehicle_id: vehicle.id,
+      trip_id: requestedTripId,
+      fuel_litres: fuelLitres,
+      fuel_cost: fuelCost,
+      price_per_litre: Number(
+        pricePerLitre.toFixed(2),
+      ),
+      odometer_reading: odometerReading,
+      fuel_date: fuelDate,
+      fuel_station: fuelStation,
+      receipt_number:
+        normalizeReceiptNumber(receiptNumber),
+      notes,
+      updated_at: new Date().toISOString(),
+    };
+
+    const oldVehicleOdometer = vehicle.odometer;
+    db.fuel_logs[index] = updated;
+
+    if (odometerReading > vehicle.odometer) {
+      vehicle.odometer = odometerReading;
+      vehicle.updated_at =
+        updated.updated_at;
+    }
+
+    try {
+      db.save();
+    } catch (error) {
+      db.fuel_logs[index] = original;
+      vehicle.odometer = oldVehicleOdometer;
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Updated fuel record ${updated.receipt_number}`,
+      "FUEL_LOG",
+      updated.id,
+    );
+
+    return res.json(serializeFuelLog(updated));
+  },
+);
+
+apiRouter.delete(
+  ["/fuel-logs/:id", "/fuel/:id"],
+  authenticateJWT,
+  requireRole(FINANCIAL_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const index = db.fuel_logs.findIndex(
+      (log) => log.id === req.params.id,
+    );
+
+    if (index === -1) {
+      return res.status(404).json({
+        error: "Fuel record not found.",
+      });
+    }
+
+    const log = db.fuel_logs[index];
+
+    if (getFuelSource(log) !== "MANUAL") {
+      return res.status(409).json({
+        error:
+          "Automatically generated fuel records cannot be deleted.",
+      });
+    }
+
+    db.fuel_logs.splice(index, 1);
+
+    try {
+      db.save();
+    } catch (error) {
+      db.fuel_logs.splice(index, 0, log);
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Deleted fuel record ${log.receipt_number}`,
+      "FUEL_LOG",
+      log.id,
+    );
+
+    return res.json({ success: true });
+  },
+);
+
 apiRouter.get(
   "/expenses",
   authenticateJWT,
   requireRole(FINANCIAL_ROLES),
   (req, res) => {
-  const list = [...db.expenses];
-  // Denormalize
-  let result = list.map(e => {
-    const vehicle = e.vehicle_id ? db.vehicles.find(v => v.id === e.vehicle_id) : null;
-    const trip = e.trip_id ? db.trips.find(t => t.id === e.trip_id) : null;
-    return {
-      ...e,
-      vehicle_reg: vehicle ? vehicle.registration_number : "N/A",
-      registration_number: vehicle ? vehicle.registration_number : "N/A",
-      vehicle_name: vehicle ? vehicle.vehicle_name : "General Operational Costs",
-      trip_code: trip ? trip.trip_code : "N/A",
-      reference_number: e.receipt_number || "N/A" // alias for frontend table
-    };
-  });
-
-  const search = req.query.search ? String(req.query.search).toLowerCase() : "";
-  if (search) {
-    result = result.filter(item => 
-      item.reference_number?.toLowerCase().includes(search) ||
-      item.receipt_number?.toLowerCase().includes(search) ||
-      item.expense_type?.toLowerCase().includes(search) ||
-      item.description?.toLowerCase().includes(search) ||
-      item.vehicle_name?.toLowerCase().includes(search) ||
-      item.vehicle_reg?.toLowerCase().includes(search)
+    const search = getSingleQueryValue(
+      req.query.search,
+    ).toLowerCase();
+    const vehicleId = getSingleQueryValue(
+      req.query.vehicle_id,
     );
-  }
+    const expenseType = getSingleQueryValue(
+      req.query.expense_type,
+    );
+    const dateFrom = getSingleQueryValue(
+      req.query.date_from,
+    );
+    const dateTo = getSingleQueryValue(
+      req.query.date_to,
+    );
+    const requestedSortField =
+      getSingleQueryValue(req.query.sort_by) ||
+      "expense_date";
+    const requestedSortOrder =
+      getSingleQueryValue(req.query.sort_order) ||
+      "desc";
 
-  res.json(result);
-});
+    if (
+      expenseType &&
+      !Object.values(ExpenseType).includes(
+        expenseType as ExpenseType,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Invalid expense type filter.",
+      });
+    }
+
+    if (dateFrom && !isIsoDate(dateFrom)) {
+      return res.status(400).json({
+        error: "Expense start date is invalid.",
+      });
+    }
+
+    if (dateTo && !isIsoDate(dateTo)) {
+      return res.status(400).json({
+        error: "Expense end date is invalid.",
+      });
+    }
+
+    if (dateFrom && dateTo && dateFrom > dateTo) {
+      return res.status(400).json({
+        error:
+          "Expense start date cannot be after the end date.",
+      });
+    }
+
+    if (
+      !EXPENSE_SORT_FIELDS.has(
+        requestedSortField as ExpenseSortField,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Invalid expense sort field.",
+      });
+    }
+
+    if (
+      requestedSortOrder !== "asc" &&
+      requestedSortOrder !== "desc"
+    ) {
+      return res.status(400).json({
+        error:
+          "Expense sort order must be asc or desc.",
+      });
+    }
+
+    let list = db.expenses.map(serializeExpense);
+
+    if (search) {
+      list = list.filter((expense) =>
+        [
+          expense.vehicle_name,
+          expense.registration_number,
+          expense.receipt_number,
+          expense.expense_type,
+          expense.description,
+          expense.trip_code ?? "",
+        ].some((value) =>
+          value.toLowerCase().includes(search),
+        ),
+      );
+    }
+
+    if (vehicleId) {
+      list = list.filter(
+        (expense) =>
+          expense.vehicle_id === vehicleId,
+      );
+    }
+
+    if (expenseType) {
+      list = list.filter(
+        (expense) =>
+          expense.expense_type === expenseType,
+      );
+    }
+
+    if (dateFrom) {
+      list = list.filter(
+        (expense) =>
+          expense.expense_date >= dateFrom,
+      );
+    }
+
+    if (dateTo) {
+      list = list.filter(
+        (expense) =>
+          expense.expense_date <= dateTo,
+      );
+    }
+
+    const sortField =
+      requestedSortField as ExpenseSortField;
+    const sortOrder: 1 | -1 =
+      requestedSortOrder === "asc" ? 1 : -1;
+
+    list.sort((first, second) =>
+      compareFinancialValues(
+        first[sortField],
+        second[sortField],
+        sortOrder,
+      ),
+    );
+
+    const summary = {
+      total_expenses: list.reduce(
+        (sum, expense) =>
+          sum + expense.amount,
+        0,
+      ),
+    };
+
+    const pageSize = parsePositiveInteger(
+      req.query.page_size,
+      10,
+      100,
+    );
+    const requestedPage = parsePositiveInteger(
+      req.query.page,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const total = list.length;
+    const totalPages = Math.max(
+      1,
+      Math.ceil(total / pageSize),
+    );
+    const page = Math.min(
+      requestedPage,
+      totalPages,
+    );
+    const startIndex = (page - 1) * pageSize;
+
+    return res.json({
+      data: list.slice(
+        startIndex,
+        startIndex + pageSize,
+      ),
+      total,
+      page,
+      page_size: pageSize,
+      total_pages: totalPages,
+      summary,
+    });
+  },
+);
 
 apiRouter.post(
   "/expenses",
   authenticateJWT,
   requireRole(FINANCIAL_ROLES),
   (req: AuthenticatedRequest, res) => {
-  const {
-    vehicle_id,
-    trip_id,
-    expense_type,
-    amount,
-    expense_date,
-    description
-  } = req.body;
+    const body = req.body ?? {};
 
-  const reference_number = req.body.reference_number || req.body.receipt_number;
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error:
+          "A valid expense payload is required.",
+      });
+    }
 
-  if (!expense_type || amount === undefined || !expense_date || !description || !reference_number) {
-    return res.status(400).json({ error: "Missing required expense details." });
-  }
+    const requestedVehicleId =
+      typeof body.vehicle_id === "string" &&
+      body.vehicle_id.trim()
+        ? body.vehicle_id.trim()
+        : undefined;
+    const requestedTripId =
+      typeof body.trip_id === "string" &&
+      body.trip_id.trim()
+        ? body.trip_id.trim()
+        : undefined;
+    const tripValidation =
+      validateFinancialTripLink(
+        requestedTripId,
+        requestedVehicleId,
+      );
 
-  const valAmount = Number(amount);
-  if (valAmount < 0) {
-    return res.status(400).json({ error: "Expense amount cannot be negative." });
-  }
+    if ("error" in tripValidation) {
+      return res
+        .status(tripValidation.status)
+        .json({ error: tripValidation.error });
+    }
 
-  // Enforce validation: must associate vehicle or trip if relevant
-  if (!vehicle_id && !trip_id) {
-    return res.status(400).json({ error: "An expense must be associated with either a vehicle or a trip." });
-  }
+    const vehicleId =
+      tripValidation.resolvedVehicleId;
 
-  const exp: Expense = {
-    id: "ex_" + Math.random().toString(36).substr(2, 9),
-    vehicle_id: vehicle_id || undefined,
-    trip_id: trip_id || undefined,
-    expense_type: expense_type as ExpenseType,
-    amount: valAmount,
-    expense_date,
-    description,
-    receipt_number: reference_number,
-    created_by: req.user!.id,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
+    if (
+      vehicleId &&
+      !getVehicleForFinancialRecord(vehicleId)
+    ) {
+      return res.status(400).json({
+        error: "The selected vehicle was not found.",
+      });
+    }
 
-  db.expenses.unshift(exp);
-  db.save();
+    if (
+      typeof body.expense_type !== "string" ||
+      !Object.values(ExpenseType).includes(
+        body.expense_type as ExpenseType,
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "A valid expense type is required.",
+      });
+    }
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Logged ${exp.expense_type} expense of Rs. ${exp.amount}`,
-    "EXPENSE",
-    exp.id
-  );
+    const amount = parseFiniteNumber(body.amount);
+    const expenseDate =
+      typeof body.expense_date === "string"
+        ? body.expense_date.trim()
+        : "";
+    const description =
+      typeof body.description === "string"
+        ? normalizeFinancialText(
+            body.description,
+          )
+        : "";
+    const receiptNumber =
+      typeof body.receipt_number === "string"
+        ? normalizeReceiptNumber(
+            body.receipt_number,
+          )
+        : typeof body.reference_number === "string"
+          ? normalizeReceiptNumber(
+              body.reference_number,
+            )
+          : "";
 
-  res.status(201).json({
-    ...exp,
-    reference_number: exp.receipt_number
-  });
-});
+    if (amount === null || amount <= 0) {
+      return res.status(400).json({
+        error:
+          "Expense amount must be greater than zero.",
+      });
+    }
 
-apiRouter.delete("/expenses/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
-  const index = db.expenses.findIndex(e => e.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Expense record not found." });
+    if (
+      !isIsoDate(expenseDate) ||
+      expenseDate > getTodayDate()
+    ) {
+      return res.status(400).json({
+        error:
+          "Expense date must be a valid date that is not in the future.",
+      });
+    }
 
-  const record = db.expenses[index];
-  db.expenses.splice(index, 1);
-  db.save();
+    if (
+      description.length < 2 ||
+      description.length > 500
+    ) {
+      return res.status(400).json({
+        error:
+          "Description must contain between 2 and 500 characters.",
+      });
+    }
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Deleted expense log of Rs. ${record.amount}`,
-    "EXPENSE",
-    record.id
-  );
+    if (
+      receiptNumber.length < 2 ||
+      receiptNumber.length > 80
+    ) {
+      return res.status(400).json({
+        error:
+          "Receipt number must contain between 2 and 80 characters.",
+      });
+    }
 
-  res.json({ success: true });
-});
+    const duplicateReceipt = db.expenses.find(
+      (expense) =>
+        normalizeReceiptNumber(
+          expense.receipt_number,
+        ) === receiptNumber,
+    );
+
+    if (duplicateReceipt) {
+      return res.status(409).json({
+        error:
+          "An expense with this receipt number already exists.",
+      });
+    }
+
+    const duplicateEntry = db.expenses.find(
+      (expense) =>
+        expense.vehicle_id === vehicleId &&
+        expense.trip_id === requestedTripId &&
+        expense.expense_type ===
+          body.expense_type &&
+        expense.expense_date === expenseDate &&
+        Math.abs(expense.amount - amount) <
+          0.01 &&
+        expense.description.toLowerCase() ===
+          description.toLowerCase(),
+    );
+
+    if (duplicateEntry) {
+      return res.status(409).json({
+        error:
+          "A matching expense record already exists.",
+      });
+    }
+
+    const now = new Date().toISOString();
+    const expense: Expense = {
+      id: db.generateId("ex"),
+      vehicle_id: vehicleId,
+      trip_id: requestedTripId,
+      expense_type:
+        body.expense_type as ExpenseType,
+      amount: Number(amount.toFixed(2)),
+      expense_date: expenseDate,
+      description,
+      receipt_number: receiptNumber,
+      created_by: req.user!.id,
+      created_at: now,
+      updated_at: now,
+    };
+
+    db.expenses.unshift(expense);
+
+    try {
+      db.save();
+    } catch (error) {
+      const index = db.expenses.findIndex(
+        (candidate) =>
+          candidate.id === expense.id,
+      );
+
+      if (index >= 0) {
+        db.expenses.splice(index, 1);
+      }
+
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Logged ${expense.expense_type} expense of Rs. ${expense.amount}`,
+      "EXPENSE",
+      expense.id,
+    );
+
+    return res
+      .status(201)
+      .json(serializeExpense(expense));
+  },
+);
+
+apiRouter.put(
+  "/expenses/:id",
+  authenticateJWT,
+  requireRole(FINANCIAL_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const index = db.expenses.findIndex(
+      (expense) =>
+        expense.id === req.params.id,
+    );
+
+    if (index === -1) {
+      return res.status(404).json({
+        error: "Expense record not found.",
+      });
+    }
+
+    const original = db.expenses[index];
+
+    if (
+      getExpenseSource(original) !== "MANUAL"
+    ) {
+      return res.status(409).json({
+        error:
+          "Automatically generated expenses cannot be edited.",
+      });
+    }
+
+    const body = req.body ?? {};
+
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error:
+          "A valid expense payload is required.",
+      });
+    }
+
+    const requestedVehicleId =
+      body.vehicle_id === null ||
+      body.vehicle_id === ""
+        ? undefined
+        : typeof body.vehicle_id === "string"
+          ? body.vehicle_id.trim()
+          : original.vehicle_id;
+    const requestedTripId =
+      body.trip_id === null ||
+      body.trip_id === ""
+        ? undefined
+        : typeof body.trip_id === "string"
+          ? body.trip_id.trim()
+          : original.trip_id;
+    const tripValidation =
+      validateFinancialTripLink(
+        requestedTripId,
+        requestedVehicleId,
+      );
+
+    if ("error" in tripValidation) {
+      return res
+        .status(tripValidation.status)
+        .json({ error: tripValidation.error });
+    }
+
+    const vehicleId =
+      tripValidation.resolvedVehicleId;
+
+    if (
+      vehicleId &&
+      !getVehicleForFinancialRecord(vehicleId)
+    ) {
+      return res.status(400).json({
+        error: "The selected vehicle was not found.",
+      });
+    }
+
+    const expenseType =
+      typeof body.expense_type === "string"
+        ? body.expense_type
+        : original.expense_type;
+
+    if (
+      !Object.values(ExpenseType).includes(
+        expenseType as ExpenseType,
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "A valid expense type is required.",
+      });
+    }
+
+    const amount =
+      hasOwnProperty(body, "amount")
+        ? parseFiniteNumber(body.amount)
+        : original.amount;
+    const expenseDate =
+      typeof body.expense_date === "string"
+        ? body.expense_date.trim()
+        : original.expense_date;
+    const description =
+      typeof body.description === "string"
+        ? normalizeFinancialText(
+            body.description,
+          )
+        : original.description;
+    const receiptNumber =
+      typeof body.receipt_number === "string"
+        ? normalizeReceiptNumber(
+            body.receipt_number,
+          )
+        : original.receipt_number;
+
+    if (amount === null || amount <= 0) {
+      return res.status(400).json({
+        error:
+          "Expense amount must be greater than zero.",
+      });
+    }
+
+    if (
+      !isIsoDate(expenseDate) ||
+      expenseDate > getTodayDate()
+    ) {
+      return res.status(400).json({
+        error:
+          "Expense date must be a valid date that is not in the future.",
+      });
+    }
+
+    if (
+      description.length < 2 ||
+      description.length > 500 ||
+      receiptNumber.length < 2 ||
+      receiptNumber.length > 80
+    ) {
+      return res.status(400).json({
+        error:
+          "Expense description or receipt number is invalid.",
+      });
+    }
+
+    const duplicateReceipt = db.expenses.find(
+      (expense) =>
+        expense.id !== original.id &&
+        normalizeReceiptNumber(
+          expense.receipt_number,
+        ) ===
+          normalizeReceiptNumber(receiptNumber),
+    );
+
+    if (duplicateReceipt) {
+      return res.status(409).json({
+        error:
+          "An expense with this receipt number already exists.",
+      });
+    }
+
+    const updated: Expense = {
+      ...original,
+      vehicle_id: vehicleId,
+      trip_id: requestedTripId,
+      expense_type:
+        expenseType as ExpenseType,
+      amount: Number(amount.toFixed(2)),
+      expense_date: expenseDate,
+      description,
+      receipt_number:
+        normalizeReceiptNumber(receiptNumber),
+      updated_at: new Date().toISOString(),
+    };
+
+    db.expenses[index] = updated;
+
+    try {
+      db.save();
+    } catch (error) {
+      db.expenses[index] = original;
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Updated expense ${updated.receipt_number}`,
+      "EXPENSE",
+      updated.id,
+    );
+
+    return res.json(serializeExpense(updated));
+  },
+);
+
+apiRouter.delete(
+  "/expenses/:id",
+  authenticateJWT,
+  requireRole(FINANCIAL_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const index = db.expenses.findIndex(
+      (expense) =>
+        expense.id === req.params.id,
+    );
+
+    if (index === -1) {
+      return res.status(404).json({
+        error: "Expense record not found.",
+      });
+    }
+
+    const expense = db.expenses[index];
+
+    if (
+      getExpenseSource(expense) !== "MANUAL"
+    ) {
+      return res.status(409).json({
+        error:
+          "Automatically generated expenses cannot be deleted.",
+      });
+    }
+
+    db.expenses.splice(index, 1);
+
+    try {
+      db.save();
+    } catch (error) {
+      db.expenses.splice(index, 0, expense);
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Deleted expense ${expense.receipt_number}`,
+      "EXPENSE",
+      expense.id,
+    );
+
+    return res.json({ success: true });
+  },
+);
 
 
 // ============================================================================
 // 8. DASHBOARD ANALYTICS ENDPOINTS
+
 // ============================================================================
 
 apiRouter.get("/dashboard/summary", authenticateJWT, (req, res) => {
@@ -4715,9 +6142,23 @@ apiRouter.get("/dashboard/summary", authenticateJWT, (req, res) => {
   // Financial math (all-time or monthly)
   const totalFuelCost = db.fuel_logs.reduce((sum, f) => sum + f.fuel_cost, 0);
   const totalMaintenanceCost = db.maintenance_logs.reduce((sum, m) => sum + (m.actual_cost || 0), 0);
-  const totalOtherExpenses = db.expenses.filter(e => e.expense_type !== ExpenseType.MAINTENANCE).reduce((sum, e) => sum + e.amount, 0);
+  const totalOtherExpenses = db.expenses
+    .filter(
+      (expense) =>
+        expense.expense_type !==
+          ExpenseType.MAINTENANCE &&
+        getExpenseSource(expense) !==
+          "LEGACY_FUEL_MIRROR",
+    )
+    .reduce(
+      (sum, expense) => sum + expense.amount,
+      0,
+    );
 
-  const totalOperationalCost = totalFuelCost + totalMaintenanceCost + totalOtherExpenses;
+  const totalOperationalCost =
+    totalFuelCost +
+    totalMaintenanceCost +
+    totalOtherExpenses;
 
   res.json({
     kpi: {
@@ -4760,12 +6201,23 @@ apiRouter.get("/dashboard/monthly-costs", authenticateJWT, (req, res) => {
   // Return costs grouped by type for charts
   const fuel = db.fuel_logs.reduce((sum, f) => sum + f.fuel_cost, 0);
   const maintenance = db.maintenance_logs.reduce((sum, m) => sum + (m.actual_cost || 0), 0);
-  const others = db.expenses.reduce((sum, e) => sum + e.amount, 0) - fuel; // prevent double counting fuel in expenses
+  const others = db.expenses
+    .filter(
+      (expense) =>
+        expense.expense_type !==
+          ExpenseType.MAINTENANCE &&
+        getExpenseSource(expense) !==
+          "LEGACY_FUEL_MIRROR",
+    )
+    .reduce(
+      (sum, expense) => sum + expense.amount,
+      0,
+    );
 
   res.json([
     { name: "Fuel Logs", cost: fuel },
     { name: "Maintenance", cost: maintenance },
-    { name: "Other Expenses", cost: Math.max(0, others) }
+    { name: "Other Expenses", cost: others }
   ]);
 });
 
