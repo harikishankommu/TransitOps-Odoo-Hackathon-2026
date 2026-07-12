@@ -1,0 +1,1793 @@
+import { Router, Response } from "express";
+import { db } from "../database.js";
+import { Security, authenticateJWT, requireRole, AuthenticatedRequest } from "../utils/auth.js";
+import { OperationsService } from "../services/operations.js";
+import {
+  UserRole,
+  VehicleStatus,
+  VehicleType,
+  FuelType,
+  DriverStatus,
+  TripStatus,
+  MaintenanceStatus,
+  MaintenanceType,
+  ExpenseType,
+  NotificationType,
+  Vehicle,
+  Driver,
+  Trip,
+  MaintenanceLog,
+  FuelLog,
+  Expense
+} from "../../types.js";
+
+const apiRouter = Router();
+
+// ============================================================================
+// 1. AUTHENTICATION ENDPOINTS
+// ============================================================================
+
+apiRouter.post("/auth/signup", (req, res) => {
+  const { full_name, email, password, confirm_password } = req.body;
+
+  if (!full_name || !email || !password || !confirm_password) {
+    return res.status(400).json({ error: "All fields are required." });
+  }
+
+  if (password !== confirm_password) {
+    return res.status(400).json({ error: "Passwords do not match." });
+  }
+
+  const existing = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+  if (existing) {
+    return res.status(400).json({ error: "Email already registered." });
+  }
+
+  // Create new user - signup defaults to DRIVER role
+  const newUser = {
+    id: "usr_" + Math.random().toString(36).substr(2, 9),
+    full_name,
+    email: email.toLowerCase(),
+    password_hash: Security.hashPassword(password),
+    role: UserRole.DRIVER, // strict requirement: default to Driver/Employee, no self-assigned Admin
+    is_active: true,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  db.users.push(newUser);
+  db.save();
+
+  // If role is driver, automatically create a basic driver profile
+  const newDriver: Driver = {
+    id: "dr_" + Math.random().toString(36).substr(2, 9),
+    user_id: newUser.id,
+    full_name: newUser.full_name,
+    licence_number: "PENDING-" + newUser.id.substr(4, 4).toUpperCase(),
+    licence_category: "Light Motor Vehicle",
+    licence_expiry_date: new Date(Date.now() + 365 * 86400000).toISOString().split("T")[0], // valid 1 year
+    contact_number: "0000000000",
+    safety_score: 100,
+    region: "Patna",
+    status: DriverStatus.AVAILABLE,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+  db.drivers.push(newDriver);
+  db.save();
+
+  db.logActivity(
+    newUser.id,
+    newUser.full_name,
+    `Registered a new account with Driver profile`,
+    "USER",
+    newUser.id
+  );
+
+  const token = Security.generateToken(newUser);
+  res.status(201).json({
+    token,
+    user: {
+      id: newUser.id,
+      full_name: newUser.full_name,
+      email: newUser.email,
+      role: newUser.role
+    }
+  });
+});
+
+apiRouter.post("/auth/login", (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required." });
+  }
+
+  const user = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+  if (!user || !Security.comparePassword(password, user.password_hash)) {
+    return res.status(401).json({ error: "Invalid email or password." });
+  }
+
+  if (!user.is_active) {
+    return res.status(403).json({ error: "Your account has been disabled. Please contact Admin." });
+  }
+
+  const token = Security.generateToken(user);
+
+  db.logActivity(user.id, user.full_name, "Logged in successfully", "USER", user.id);
+
+  res.json({
+    token,
+    user: {
+      id: user.id,
+      full_name: user.full_name,
+      email: user.email,
+      role: user.role
+    }
+  });
+});
+
+apiRouter.get("/auth/me", authenticateJWT, (req: AuthenticatedRequest, res) => {
+  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+  res.json({
+    id: req.user.id,
+    full_name: req.user.full_name,
+    email: req.user.email,
+    role: req.user.role,
+    is_active: req.user.is_active
+  });
+});
+
+apiRouter.post("/auth/logout", authenticateJWT, (req: AuthenticatedRequest, res) => {
+  if (req.user) {
+    db.logActivity(req.user.id, req.user.full_name, "Logged out", "USER", req.user.id);
+  }
+  res.json({ success: true });
+});
+
+
+// ============================================================================
+// 2. USER ENDPOINTS
+// ============================================================================
+
+apiRouter.get("/users", authenticateJWT, requireRole([UserRole.ADMIN]), (req, res) => {
+  // admin views all users
+  const result = db.users.map(u => ({
+    id: u.id,
+    full_name: u.full_name,
+    email: u.email,
+    role: u.role,
+    is_active: u.is_active,
+    created_at: u.created_at
+  }));
+  res.json(result);
+});
+
+apiRouter.patch("/users/:id/role", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
+  const { role } = req.body;
+  if (!role || !Object.values(UserRole).includes(role)) {
+    return res.status(400).json({ error: "Invalid role specified." });
+  }
+
+  const targetUser = db.users.find(u => u.id === req.params.id);
+  if (!targetUser) return res.status(404).json({ error: "User not found." });
+
+  if (targetUser.id === req.user?.id) {
+    return res.status(400).json({ error: "You cannot change your own role." });
+  }
+
+  const oldRole = targetUser.role;
+  targetUser.role = role;
+  targetUser.updated_at = new Date().toISOString();
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Changed user ${targetUser.full_name}'s role`,
+    "USER",
+    targetUser.id,
+    oldRole,
+    role
+  );
+
+  res.json({ success: true, user: targetUser });
+});
+
+apiRouter.patch("/users/:id/status", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
+  const { is_active } = req.body;
+  if (is_active === undefined) {
+    return res.status(400).json({ error: "is_active is required." });
+  }
+
+  const targetUser = db.users.find(u => u.id === req.params.id);
+  if (!targetUser) return res.status(404).json({ error: "User not found." });
+
+  if (targetUser.id === req.user?.id) {
+    return res.status(400).json({ error: "You cannot disable your own account." });
+  }
+
+  const oldStatus = targetUser.is_active ? "ACTIVE" : "DISABLED";
+  targetUser.is_active = !!is_active;
+  targetUser.updated_at = new Date().toISOString();
+  db.save();
+
+  const newStatus = targetUser.is_active ? "ACTIVE" : "DISABLED";
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Changed user ${targetUser.full_name}'s status`,
+    "USER",
+    targetUser.id,
+    oldStatus,
+    newStatus
+  );
+
+  res.json({ success: true, user: targetUser });
+});
+
+
+// ============================================================================
+// 3. VEHICLE MODULE ENDPOINTS
+// ============================================================================
+
+apiRouter.get("/vehicles/available", authenticateJWT, (req, res) => {
+  // Vehicles that can be dispatched
+  const result = db.vehicles.filter(
+    v => v.status === VehicleStatus.AVAILABLE
+  );
+  res.json(result);
+});
+
+apiRouter.get("/vehicles", authenticateJWT, (req, res) => {
+  const { search, status, vehicle_type, region, sort_by, sort_order } = req.query;
+
+  let list = [...db.vehicles];
+
+  // Search filter
+  if (search) {
+    const q = (search as string).toLowerCase();
+    list = list.filter(
+      v =>
+        v.registration_number.toLowerCase().includes(q) ||
+        v.vehicle_name.toLowerCase().includes(q) ||
+        v.model.toLowerCase().includes(q)
+    );
+  }
+
+  // Filters
+  if (status) {
+    list = list.filter(v => v.status === status);
+  }
+  if (vehicle_type) {
+    list = list.filter(v => v.vehicle_type === vehicle_type);
+  }
+  if (region) {
+    list = list.filter(v => v.region.toLowerCase() === (region as string).toLowerCase());
+  }
+
+  // Sorting
+  if (sort_by) {
+    const field = sort_by as keyof Vehicle;
+    const order = sort_order === "desc" ? -1 : 1;
+    list.sort((a, b) => {
+      const valA = a[field];
+      const valB = b[field];
+      if (valA === undefined || valB === undefined) return 0;
+      if (typeof valA === "string" && typeof valB === "string") {
+        return valA.localeCompare(valB) * order;
+      }
+      return ((valA as number) - (valB as number)) * order;
+    });
+  } else {
+    // default newest first
+    list.sort((a, b) => b.created_at.localeCompare(a.created_at));
+  }
+
+  // Simple Pagination
+  const page = parseInt(req.query.page as string, 10) || 1;
+  const pageSize = parseInt(req.query.page_size as string, 10) || 15;
+  const total = list.length;
+  const paginated = list.slice((page - 1) * pageSize, page * pageSize);
+
+  res.json({
+    data: paginated,
+    total,
+    page,
+    page_size: pageSize
+  });
+});
+
+apiRouter.get("/vehicles/:id", authenticateJWT, (req, res) => {
+  const vehicle = db.vehicles.find(v => v.id === req.params.id);
+  if (!vehicle) return res.status(404).json({ error: "Vehicle not found." });
+  res.json(vehicle);
+});
+
+apiRouter.get("/vehicles/:id/history", authenticateJWT, (req, res) => {
+  const trips = db.trips.filter(t => t.vehicle_id === req.params.id);
+  const maintenance = db.maintenance_logs.filter(m => m.vehicle_id === req.params.id);
+  const expenses = db.expenses.filter(e => e.vehicle_id === req.params.id);
+  const fuel = db.fuel_logs.filter(f => f.vehicle_id === req.params.id);
+
+  res.json({
+    trips,
+    maintenance,
+    expenses,
+    fuel
+  });
+});
+
+apiRouter.post("/vehicles", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
+  const {
+    registration_number,
+    vehicle_name,
+    model,
+    vehicle_type,
+    maximum_load_capacity,
+    odometer,
+    acquisition_cost,
+    region,
+    manufacture_year,
+    fuel_type
+  } = req.body;
+
+  if (!registration_number || !vehicle_name || !model || !vehicle_type || !maximum_load_capacity || !region) {
+    return res.status(400).json({ error: "Missing required fields." });
+  }
+
+  const normReg = registration_number.replace(/\s+/g, "").toUpperCase();
+  const existing = db.vehicles.find(v => v.registration_number.replace(/\s+/g, "").toUpperCase() === normReg);
+  if (existing) {
+    return res.status(400).json({ error: `Vehicle registration number ${registration_number} already exists.` });
+  }
+
+  if (maximum_load_capacity <= 0) {
+    return res.status(400).json({ error: "Maximum load capacity must be positive." });
+  }
+  if (odometer !== undefined && odometer < 0) {
+    return res.status(400).json({ error: "Odometer cannot be negative." });
+  }
+  if (acquisition_cost !== undefined && acquisition_cost < 0) {
+    return res.status(400).json({ error: "Acquisition cost cannot be negative." });
+  }
+
+  const newVehicle: Vehicle = {
+    id: "vh_" + Math.random().toString(36).substr(2, 9),
+    registration_number: registration_number.toUpperCase(),
+    vehicle_name,
+    model,
+    vehicle_type: vehicle_type as VehicleType,
+    maximum_load_capacity: Number(maximum_load_capacity),
+    odometer: Number(odometer || 0),
+    acquisition_cost: Number(acquisition_cost || 0),
+    region,
+    manufacture_year: Number(manufacture_year || new Date().getFullYear()),
+    fuel_type: fuel_type as FuelType,
+    status: VehicleStatus.AVAILABLE,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  db.vehicles.push(newVehicle);
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Created vehicle ${newVehicle.vehicle_name} (${newVehicle.registration_number})`,
+    "VEHICLE",
+    newVehicle.id
+  );
+
+  res.status(201).json(newVehicle);
+});
+
+apiRouter.put("/vehicles/:id", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
+  const vehicle = db.vehicles.find(v => v.id === req.params.id);
+  if (!vehicle) return res.status(404).json({ error: "Vehicle not found." });
+
+  const {
+    registration_number,
+    vehicle_name,
+    model,
+    vehicle_type,
+    maximum_load_capacity,
+    odometer,
+    acquisition_cost,
+    region,
+    manufacture_year,
+    fuel_type,
+    status
+  } = req.body;
+
+  if (registration_number) {
+    const normReg = registration_number.replace(/\s+/g, "").toUpperCase();
+    const existing = db.vehicles.find(v => v.id !== vehicle.id && v.registration_number.replace(/\s+/g, "").toUpperCase() === normReg);
+    if (existing) {
+      return res.status(400).json({ error: "Vehicle registration number already exists." });
+    }
+    vehicle.registration_number = registration_number.toUpperCase();
+  }
+
+  if (maximum_load_capacity !== undefined) {
+    if (maximum_load_capacity <= 0) return res.status(400).json({ error: "Maximum load capacity must be positive." });
+    vehicle.maximum_load_capacity = Number(maximum_load_capacity);
+  }
+
+  if (odometer !== undefined) {
+    if (odometer < 0) return res.status(400).json({ error: "Odometer cannot be negative." });
+    vehicle.odometer = Number(odometer);
+  }
+
+  if (acquisition_cost !== undefined) {
+    if (acquisition_cost < 0) return res.status(400).json({ error: "Acquisition cost cannot be negative." });
+    vehicle.acquisition_cost = Number(acquisition_cost);
+  }
+
+  if (vehicle_name) vehicle.vehicle_name = vehicle_name;
+  if (model) vehicle.model = model;
+  if (vehicle_type) vehicle.vehicle_type = vehicle_type as VehicleType;
+  if (region) vehicle.region = region;
+  if (manufacture_year) vehicle.manufacture_year = Number(manufacture_year);
+  if (fuel_type) vehicle.fuel_type = fuel_type as FuelType;
+
+  const oldStatus = vehicle.status;
+  if (status && Object.values(VehicleStatus).includes(status)) {
+    // If retiring
+    if (status === VehicleStatus.RETIRED && oldStatus === VehicleStatus.ON_TRIP) {
+      return res.status(400).json({ error: "Cannot retire a vehicle currently on a trip." });
+    }
+    vehicle.status = status as VehicleStatus;
+  }
+
+  vehicle.updated_at = new Date().toISOString();
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Updated vehicle ${vehicle.vehicle_name}`,
+    "VEHICLE",
+    vehicle.id,
+    oldStatus !== vehicle.status ? oldStatus : undefined,
+    oldStatus !== vehicle.status ? vehicle.status : undefined
+  );
+
+  res.json(vehicle);
+});
+
+apiRouter.delete("/vehicles/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
+  const index = db.vehicles.findIndex(v => v.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: "Vehicle not found." });
+
+  const vehicle = db.vehicles[index];
+  if (vehicle.status === VehicleStatus.ON_TRIP) {
+    return res.status(400).json({ error: "Cannot delete a vehicle while it is On Trip." });
+  }
+
+  db.vehicles.splice(index, 1);
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Deleted vehicle ${vehicle.vehicle_name} (${vehicle.registration_number})`,
+    "VEHICLE",
+    vehicle.id
+  );
+
+  res.json({ success: true });
+});
+
+
+// ============================================================================
+// 4. DRIVER MODULE ENDPOINTS
+// ============================================================================
+
+apiRouter.get("/drivers/available", authenticateJWT, (req, res) => {
+  // available and licence is valid
+  const todayStr = new Date().toISOString().split("T")[0];
+  const list = db.drivers.filter(
+    d => d.status === DriverStatus.AVAILABLE && d.licence_expiry_date >= todayStr
+  );
+  res.json(list);
+});
+
+apiRouter.get("/drivers", authenticateJWT, (req, res) => {
+  const { search, status, licence_status, region } = req.query;
+
+  let list = [...db.drivers];
+
+  // Search
+  if (search) {
+    const q = (search as string).toLowerCase();
+    list = list.filter(
+      d =>
+        d.full_name.toLowerCase().includes(q) ||
+        d.licence_number.toLowerCase().includes(q) ||
+        d.contact_number.includes(q)
+    );
+  }
+
+  // Filters
+  if (status) {
+    list = list.filter(d => d.status === status);
+  }
+
+  if (region) {
+    list = list.filter(d => d.region.toLowerCase() === (region as string).toLowerCase());
+  }
+
+  if (licence_status) {
+    const today = new Date();
+    const limit30 = new Date(Date.now() + 30 * 86400000);
+    const todayStr = today.toISOString().split("T")[0];
+    const limitStr = limit30.toISOString().split("T")[0];
+
+    if (licence_status === "VALID") {
+      list = list.filter(d => d.licence_expiry_date > limitStr);
+    } else if (licence_status === "EXPIRING_SOON") {
+      list = list.filter(d => d.licence_expiry_date >= todayStr && d.licence_expiry_date <= limitStr);
+    } else if (licence_status === "EXPIRED") {
+      list = list.filter(d => d.licence_expiry_date < todayStr);
+    }
+  }
+
+  // Sort by safety score descending by default
+  list.sort((a, b) => b.safety_score - a.safety_score);
+
+  res.json(list);
+});
+
+apiRouter.get("/drivers/:id", authenticateJWT, (req, res) => {
+  const driver = db.drivers.find(d => d.id === req.params.id);
+  if (!driver) return res.status(404).json({ error: "Driver not found." });
+  res.json(driver);
+});
+
+apiRouter.post("/drivers", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER, UserRole.SAFETY_OFFICER]), (req: AuthenticatedRequest, res) => {
+  const {
+    full_name,
+    licence_number,
+    licence_category,
+    licence_expiry_date,
+    contact_number,
+    safety_score,
+    region,
+    status
+  } = req.body;
+
+  if (!full_name || !licence_number || !licence_expiry_date || !contact_number) {
+    return res.status(400).json({ error: "Missing required fields." });
+  }
+
+  const existing = db.drivers.find(d => d.licence_number.toUpperCase() === licence_number.toUpperCase());
+  if (existing) {
+    return res.status(400).json({ error: "Licence number must be unique." });
+  }
+
+  const score = safety_score !== undefined ? Number(safety_score) : 100;
+  if (score < 0 || score > 100) {
+    return res.status(400).json({ error: "Safety score must be between 0 and 100." });
+  }
+
+  const newDriver: Driver = {
+    id: "dr_" + Math.random().toString(36).substr(2, 9),
+    full_name,
+    licence_number: licence_number.toUpperCase(),
+    licence_category: licence_category || "Heavy Commercial",
+    licence_expiry_date,
+    contact_number,
+    safety_score: score,
+    region: region || "Patna",
+    status: (status as DriverStatus) || DriverStatus.AVAILABLE,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  db.drivers.push(newDriver);
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Registered driver ${newDriver.full_name} (${newDriver.licence_number})`,
+    "DRIVER",
+    newDriver.id
+  );
+
+  res.status(201).json(newDriver);
+});
+
+apiRouter.put("/drivers/:id", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER, UserRole.SAFETY_OFFICER]), (req: AuthenticatedRequest, res) => {
+  const driver = db.drivers.find(d => d.id === req.params.id);
+  if (!driver) return res.status(404).json({ error: "Driver not found." });
+
+  const {
+    full_name,
+    licence_number,
+    licence_category,
+    licence_expiry_date,
+    contact_number,
+    safety_score,
+    region,
+    status
+  } = req.body;
+
+  if (licence_number) {
+    const existing = db.drivers.find(d => d.id !== driver.id && d.licence_number.toUpperCase() === licence_number.toUpperCase());
+    if (existing) {
+      return res.status(400).json({ error: "Licence number must be unique." });
+    }
+    driver.licence_number = licence_number.toUpperCase();
+  }
+
+  if (safety_score !== undefined) {
+    const score = Number(safety_score);
+    if (score < 0 || score > 100) {
+      return res.status(400).json({ error: "Safety score must be between 0 and 100." });
+    }
+    driver.safety_score = score;
+  }
+
+  if (full_name) driver.full_name = full_name;
+  if (licence_category) driver.licence_category = licence_category;
+  if (licence_expiry_date) driver.licence_expiry_date = licence_expiry_date;
+  if (contact_number) driver.contact_number = contact_number;
+  if (region) driver.region = region;
+  if (status && Object.values(DriverStatus).includes(status)) {
+    driver.status = status as DriverStatus;
+  }
+
+  driver.updated_at = new Date().toISOString();
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Updated driver profile for ${driver.full_name}`,
+    "DRIVER",
+    driver.id
+  );
+
+  res.json(driver);
+});
+
+apiRouter.patch("/drivers/:id/suspend", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.SAFETY_OFFICER]), (req: AuthenticatedRequest, res) => {
+  const driver = db.drivers.find(d => d.id === req.params.id);
+  if (!driver) return res.status(404).json({ error: "Driver not found." });
+
+  if (driver.status === DriverStatus.ON_TRIP) {
+    return res.status(400).json({ error: "Cannot suspend a driver currently on trip." });
+  }
+
+  const oldStatus = driver.status;
+  driver.status = DriverStatus.SUSPENDED;
+  driver.updated_at = new Date().toISOString();
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Suspended driver ${driver.full_name}`,
+    "DRIVER",
+    driver.id,
+    oldStatus,
+    DriverStatus.SUSPENDED
+  );
+
+  res.json(driver);
+});
+
+apiRouter.patch("/drivers/:id/activate", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.SAFETY_OFFICER]), (req: AuthenticatedRequest, res) => {
+  const driver = db.drivers.find(d => d.id === req.params.id);
+  if (!driver) return res.status(404).json({ error: "Driver not found." });
+
+  const oldStatus = driver.status;
+  driver.status = DriverStatus.AVAILABLE;
+  driver.updated_at = new Date().toISOString();
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Activated driver ${driver.full_name}`,
+    "DRIVER",
+    driver.id,
+    oldStatus,
+    DriverStatus.AVAILABLE
+  );
+
+  res.json(driver);
+});
+
+apiRouter.delete("/drivers/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
+  const index = db.drivers.findIndex(d => d.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: "Driver not found." });
+
+  const driver = db.drivers[index];
+  if (driver.status === DriverStatus.ON_TRIP) {
+    return res.status(400).json({ error: "Cannot delete a driver while they are On Trip." });
+  }
+
+  db.drivers.splice(index, 1);
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Deleted driver ${driver.full_name} (${driver.licence_number})`,
+    "DRIVER",
+    driver.id
+  );
+
+  res.json({ success: true });
+});
+
+
+// ============================================================================
+// 5. TRIP MODULE ENDPOINTS
+// ============================================================================
+
+apiRouter.get("/trips", authenticateJWT, (req: AuthenticatedRequest, res) => {
+  const { status, vehicle_id, driver_id, search } = req.query;
+
+  let list = [...db.trips];
+
+  // If driver, restrict view to only their assigned trips
+  if (req.user?.role === UserRole.DRIVER) {
+    const driverProfile = db.drivers.find(d => d.user_id === req.user?.id);
+    if (driverProfile) {
+      list = list.filter(t => t.driver_id === driverProfile.id);
+    } else {
+      list = []; // no profile, no trips
+    }
+  }
+
+  // Filters
+  if (status) {
+    list = list.filter(t => t.status === status);
+  }
+  if (vehicle_id) {
+    list = list.filter(t => t.vehicle_id === vehicle_id);
+  }
+  if (driver_id) {
+    list = list.filter(t => t.driver_id === driver_id);
+  }
+
+  if (search) {
+    const q = (search as string).toLowerCase();
+    list = list.filter(
+      t =>
+        t.trip_code.toLowerCase().includes(q) ||
+        t.source.toLowerCase().includes(q) ||
+        t.destination.toLowerCase().includes(q) ||
+        t.cargo_description.toLowerCase().includes(q)
+    );
+  }
+
+  // Sort by created_at newest first
+  list.sort((a, b) => b.created_at.localeCompare(a.created_at));
+
+  // Denormalize vehicles and drivers for response
+  const result = list.map(t => {
+    const vehicle = db.vehicles.find(v => v.id === t.vehicle_id);
+    const driver = db.drivers.find(d => d.id === t.driver_id);
+    return {
+      ...t,
+      vehicle_name: vehicle ? `${vehicle.vehicle_name} (${vehicle.registration_number})` : "Unknown Vehicle",
+      vehicle_capacity: vehicle?.maximum_load_capacity || 0,
+      driver_name: driver ? driver.full_name : "Unknown Driver",
+      driver_licence_valid: driver ? driver.licence_expiry_date >= new Date().toISOString().split("T")[0] : false
+    };
+  });
+
+  res.json(result);
+});
+
+apiRouter.get("/trips/:id", authenticateJWT, (req, res) => {
+  const t = db.trips.find(trip => trip.id === req.params.id);
+  if (!t) return res.status(404).json({ error: "Trip not found." });
+
+  const vehicle = db.vehicles.find(v => v.id === t.vehicle_id);
+  const driver = db.drivers.find(d => d.id === t.driver_id);
+
+  res.json({
+    ...t,
+    vehicle_name: vehicle ? `${vehicle.vehicle_name} (${vehicle.registration_number})` : "Unknown Vehicle",
+    vehicle_capacity: vehicle?.maximum_load_capacity || 0,
+    vehicle_reg: vehicle?.registration_number,
+    driver_name: driver ? driver.full_name : "Unknown Driver",
+    driver_licence: driver?.licence_number,
+    driver_licence_expiry: driver?.licence_expiry_date,
+    driver_phone: driver?.contact_number,
+    driver_score: driver?.safety_score
+  });
+});
+
+apiRouter.post("/trips", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
+  const {
+    source,
+    destination,
+    vehicle_id,
+    driver_id,
+    cargo_description,
+    cargo_weight,
+    planned_distance,
+    planned_start_time,
+    revenue,
+    notes
+  } = req.body;
+
+  if (!source || !destination || !vehicle_id || !driver_id || !cargo_description || !cargo_weight || !planned_distance || !planned_start_time) {
+    return res.status(400).json({ error: "Missing required trip details." });
+  }
+
+  const weight = Number(cargo_weight);
+  const dist = Number(planned_distance);
+  const rev = Number(revenue || 0);
+
+  if (weight <= 0) return res.status(400).json({ error: "Cargo weight must be positive." });
+  if (dist <= 0) return res.status(400).json({ error: "Planned distance must be positive." });
+  if (rev < 0) return res.status(400).json({ error: "Revenue cannot be negative." });
+
+  const vehicle = db.vehicles.find(v => v.id === vehicle_id);
+  if (!vehicle) return res.status(400).json({ error: "Selected vehicle does not exist." });
+
+  const driver = db.drivers.find(d => d.id === driver_id);
+  if (!driver) return res.status(400).json({ error: "Selected driver does not exist." });
+
+  // Warning check in creation too (cargo weight cannot exceed vehicle capacity)
+  if (weight > vehicle.maximum_load_capacity) {
+    return res.status(400).json({
+      error: `Cargo weight of ${weight} kg exceeds selected vehicle's capacity of ${vehicle.maximum_load_capacity} kg.`
+    });
+  }
+
+  // Create DRAFT trip
+  const newTrip: Trip = {
+    id: "tr_" + Math.random().toString(36).substr(2, 9),
+    trip_code: OperationsService.generateTripCode(),
+    source,
+    destination,
+    vehicle_id,
+    driver_id,
+    cargo_description,
+    cargo_weight: weight,
+    planned_distance: dist,
+    planned_start_time,
+    revenue: rev,
+    notes,
+    status: TripStatus.DRAFT,
+    created_by: req.user!.id,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  db.trips.push(newTrip);
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Created draft trip ${newTrip.trip_code}`,
+    "TRIP",
+    newTrip.id
+  );
+
+  res.status(201).json(newTrip);
+});
+
+apiRouter.put("/trips/:id", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
+  const trip = db.trips.find(t => t.id === req.params.id);
+  if (!trip) return res.status(404).json({ error: "Trip not found." });
+
+  if (trip.status !== TripStatus.DRAFT) {
+    return res.status(400).json({ error: "Only draft trips can be updated." });
+  }
+
+  const {
+    source,
+    destination,
+    vehicle_id,
+    driver_id,
+    cargo_description,
+    cargo_weight,
+    planned_distance,
+    planned_start_time,
+    revenue,
+    notes
+  } = req.body;
+
+  if (vehicle_id) {
+    const vehicle = db.vehicles.find(v => v.id === vehicle_id);
+    if (!vehicle) return res.status(400).json({ error: "Vehicle not found." });
+    trip.vehicle_id = vehicle_id;
+  }
+
+  if (driver_id) {
+    const driver = db.drivers.find(d => d.id === driver_id);
+    if (!driver) return res.status(400).json({ error: "Driver not found." });
+    trip.driver_id = driver_id;
+  }
+
+  if (source) trip.source = source;
+  if (destination) trip.destination = destination;
+  if (cargo_description) trip.cargo_description = cargo_description;
+  if (planned_start_time) trip.planned_start_time = planned_start_time;
+  if (notes !== undefined) trip.notes = notes;
+
+  if (cargo_weight !== undefined) {
+    const weight = Number(cargo_weight);
+    if (weight <= 0) return res.status(400).json({ error: "Cargo weight must be positive." });
+    trip.cargo_weight = weight;
+  }
+
+  if (planned_distance !== undefined) {
+    const dist = Number(planned_distance);
+    if (dist <= 0) return res.status(400).json({ error: "Planned distance must be positive." });
+    trip.planned_distance = dist;
+  }
+
+  if (revenue !== undefined) {
+    const rev = Number(revenue);
+    if (rev < 0) return res.status(400).json({ error: "Revenue cannot be negative." });
+    trip.revenue = rev;
+  }
+
+  trip.updated_at = new Date().toISOString();
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Updated trip ${trip.trip_code}`,
+    "TRIP",
+    trip.id
+  );
+
+  res.json(trip);
+});
+
+apiRouter.delete("/trips/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
+  const index = db.trips.findIndex(t => t.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: "Trip not found." });
+
+  const trip = db.trips[index];
+  if (trip.status === TripStatus.DISPATCHED) {
+    return res.status(400).json({ error: "Cannot delete a dispatched trip. Cancel it first." });
+  }
+
+  db.trips.splice(index, 1);
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Deleted trip ${trip.trip_code}`,
+    "TRIP",
+    trip.id
+  );
+
+  res.json({ success: true });
+});
+
+// Operations Transitions Endpoints
+
+apiRouter.post("/trips/:id/dispatch", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
+  try {
+    const dispatcher = { id: req.user!.id, name: req.user!.full_name };
+    const trip = OperationsService.dispatchTrip(req.params.id, dispatcher);
+    res.json(trip);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post("/trips/:id/complete", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER, UserRole.DRIVER]), (req: AuthenticatedRequest, res) => {
+  try {
+    const { actual_distance, final_odometer, fuel_consumed, revenue, notes } = req.body;
+
+    if (actual_distance === undefined || final_odometer === undefined || fuel_consumed === undefined) {
+      return res.status(400).json({ error: "Actual distance, final odometer, and fuel consumed are required to complete a trip." });
+    }
+
+    const operator = { id: req.user!.id, name: req.user!.full_name };
+    const trip = OperationsService.completeTrip(
+      req.params.id,
+      {
+        actual_distance: Number(actual_distance),
+        final_odometer: Number(final_odometer),
+        fuel_consumed: Number(fuel_consumed),
+        revenue: revenue !== undefined ? Number(revenue) : undefined,
+        notes
+      },
+      operator
+    );
+    res.json(trip);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post("/trips/:id/cancel", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
+  try {
+    const operator = { id: req.user!.id, name: req.user!.full_name };
+    const trip = OperationsService.cancelTrip(req.params.id, operator);
+    res.json(trip);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+
+// ============================================================================
+// 6. MAINTENANCE MODULE ENDPOINTS
+// ============================================================================
+
+apiRouter.get("/maintenance", authenticateJWT, (req, res) => {
+  const { status, vehicle_id } = req.query;
+
+  let list = [...db.maintenance_logs];
+
+  if (status) {
+    list = list.filter(m => m.status === status);
+  }
+  if (vehicle_id) {
+    list = list.filter(m => m.vehicle_id === vehicle_id);
+  }
+
+  // Denormalize vehicles
+  const result = list.map(m => {
+    const vehicle = db.vehicles.find(v => v.id === m.vehicle_id);
+    return {
+      ...m,
+      vehicle_reg: vehicle ? vehicle.registration_number : "Unknown",
+      vehicle_name: vehicle ? vehicle.vehicle_name : "Unknown"
+    };
+  });
+
+  res.json(result);
+});
+
+apiRouter.get("/maintenance/:id", authenticateJWT, (req, res) => {
+  const log = db.maintenance_logs.find(m => m.id === req.params.id);
+  if (!log) return res.status(404).json({ error: "Maintenance log not found." });
+
+  const vehicle = db.vehicles.find(v => v.id === log.vehicle_id);
+  res.json({
+    ...log,
+    vehicle_reg: vehicle ? vehicle.registration_number : "Unknown",
+    vehicle_name: vehicle ? vehicle.vehicle_name : "Unknown"
+  });
+});
+
+apiRouter.post("/maintenance", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
+  const {
+    vehicle_id,
+    maintenance_type,
+    description,
+    service_provider,
+    start_date,
+    expected_completion_date,
+    estimated_cost,
+    odometer_at_service
+  } = req.body;
+
+  if (!vehicle_id || !maintenance_type || !start_date || !expected_completion_date || estimated_cost === undefined || odometer_at_service === undefined) {
+    return res.status(400).json({ error: "Missing required fields." });
+  }
+
+  try {
+    const operator = { id: req.user!.id, name: req.user!.full_name };
+    const log = OperationsService.startMaintenance(
+      {
+        vehicle_id,
+        maintenance_type: maintenance_type as MaintenanceType,
+        description: description || "",
+        service_provider: service_provider || "Internal",
+        start_date,
+        expected_completion_date,
+        estimated_cost: Number(estimated_cost),
+        odometer_at_service: Number(odometer_at_service)
+      },
+      operator
+    );
+    res.status(201).json(log);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post("/maintenance/:id/complete", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
+  const { actual_cost, completed_date, notes } = req.body;
+
+  if (actual_cost === undefined || !completed_date) {
+    return res.status(400).json({ error: "Actual cost and completed date are required." });
+  }
+
+  try {
+    const operator = { id: req.user!.id, name: req.user!.full_name };
+    const log = OperationsService.completeMaintenance(
+      req.params.id,
+      {
+        actual_cost: Number(actual_cost),
+        completed_date,
+        notes
+      },
+      operator
+    );
+    res.json(log);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.post("/maintenance/:id/cancel", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
+  try {
+    const operator = { id: req.user!.id, name: req.user!.full_name };
+    const log = OperationsService.cancelMaintenance(req.params.id, operator);
+    res.json(log);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+
+// ============================================================================
+// 7. FUEL LOGS & EXPENSE MODULE ENDPOINTS
+// ============================================================================
+
+// Fuel Logs CRUD
+apiRouter.get(["/fuel-logs", "/fuel"], authenticateJWT, (req, res) => {
+  const list = [...db.fuel_logs];
+  // Denormalize vehicles
+  let result = list.map(f => {
+    const vehicle = db.vehicles.find(v => v.id === f.vehicle_id);
+    const trip = f.trip_id ? db.trips.find(t => t.id === f.trip_id) : null;
+    return {
+      ...f,
+      vehicle_reg: vehicle ? vehicle.registration_number : "Unknown",
+      registration_number: vehicle ? vehicle.registration_number : "Unknown",
+      vehicle_name: vehicle ? vehicle.vehicle_name : "Unknown",
+      trip_code: trip ? trip.trip_code : undefined,
+      bill_number: f.receipt_number, // alias for frontend table
+      refill_date: f.fuel_date // alias for frontend table
+    };
+  });
+
+  const search = req.query.search ? String(req.query.search).toLowerCase() : "";
+  if (search) {
+    result = result.filter(item => 
+      item.bill_number?.toLowerCase().includes(search) ||
+      item.receipt_number?.toLowerCase().includes(search) ||
+      item.vehicle_name?.toLowerCase().includes(search) ||
+      item.vehicle_reg?.toLowerCase().includes(search) ||
+      (item.notes && item.notes.toLowerCase().includes(search))
+    );
+  }
+
+  res.json(result);
+});
+
+apiRouter.post(["/fuel-logs", "/fuel"], authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER, UserRole.DRIVER, UserRole.FINANCIAL_ANALYST]), (req: AuthenticatedRequest, res) => {
+  const {
+    vehicle_id,
+    trip_id,
+    fuel_litres,
+    price_per_litre,
+    odometer_reading,
+    notes
+  } = req.body;
+
+  // support both frontend names and backend schema names
+  const bill_number = req.body.bill_number || req.body.receipt_number;
+  const refill_date = req.body.refill_date || req.body.fuel_date;
+  
+  // calculate fuel_cost if not specified
+  const cost = req.body.fuel_cost !== undefined ? Number(req.body.fuel_cost) : (Number(fuel_litres) * Number(price_per_litre));
+
+  if (!vehicle_id || !fuel_litres || !cost || !odometer_reading || !refill_date || !bill_number) {
+    return res.status(400).json({ error: "Missing required fuel log fields." });
+  }
+
+  const litres = Number(fuel_litres);
+  const odom = Number(odometer_reading);
+
+  if (litres <= 0) return res.status(400).json({ error: "Fuel litres must be greater than zero." });
+  if (cost < 0) return res.status(400).json({ error: "Fuel cost cannot be negative." });
+
+  const vehicle = db.vehicles.find(v => v.id === vehicle_id);
+  if (!vehicle) return res.status(400).json({ error: "Vehicle not found." });
+
+  if (odom < vehicle.odometer) {
+    return res.status(400).json({ error: `Odometer reading cannot be below the vehicle's current odometer (${vehicle.odometer}).` });
+  }
+
+  const calculated_price_per_litre = price_per_litre ? Number(price_per_litre) : Number((cost / litres).toFixed(2));
+
+  const fLog: FuelLog = {
+    id: "fl_" + Math.random().toString(36).substr(2, 9),
+    vehicle_id,
+    trip_id: trip_id || undefined,
+    fuel_litres: litres,
+    fuel_cost: cost,
+    price_per_litre: calculated_price_per_litre,
+    odometer_reading: odom,
+    fuel_date: refill_date,
+    fuel_station: req.body.fuel_station || "Generic Station",
+    receipt_number: bill_number,
+    notes,
+    created_by: req.user!.id,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  db.fuel_logs.unshift(fLog);
+
+  // Update vehicle odometer
+  vehicle.odometer = odom;
+  vehicle.updated_at = new Date().toISOString();
+
+  // Also auto-record a corresponding fuel Expense
+  const fuelExpense: Expense = {
+    id: "ex_" + Math.random().toString(36).substr(2, 9),
+    vehicle_id: vehicle.id,
+    trip_id: trip_id || undefined,
+    expense_type: ExpenseType.OTHER,
+    amount: cost,
+    expense_date: refill_date,
+    description: `Fuel Purchase: ${litres}L @ ${calculated_price_per_litre}/L at ${fLog.fuel_station}`,
+    receipt_number: bill_number,
+    created_by: req.user!.id,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+  db.expenses.unshift(fuelExpense);
+
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Logged ${litres} litres fuel for vehicle ${vehicle.registration_number}`,
+    "FUEL_LOG",
+    fLog.id
+  );
+
+  res.status(201).json({
+    ...fLog,
+    bill_number: fLog.receipt_number,
+    refill_date: fLog.fuel_date
+  });
+});
+
+apiRouter.delete("/fuel-logs/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
+  const index = db.fuel_logs.findIndex(f => f.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: "Fuel log not found." });
+
+  const log = db.fuel_logs[index];
+  db.fuel_logs.splice(index, 1);
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Deleted fuel log entry ${log.receipt_number}`,
+    "FUEL_LOG",
+    log.id
+  );
+
+  res.json({ success: true });
+});
+
+// Expenses CRUD
+apiRouter.get("/expenses", authenticateJWT, (req, res) => {
+  const list = [...db.expenses];
+  // Denormalize
+  let result = list.map(e => {
+    const vehicle = e.vehicle_id ? db.vehicles.find(v => v.id === e.vehicle_id) : null;
+    const trip = e.trip_id ? db.trips.find(t => t.id === e.trip_id) : null;
+    return {
+      ...e,
+      vehicle_reg: vehicle ? vehicle.registration_number : "N/A",
+      registration_number: vehicle ? vehicle.registration_number : "N/A",
+      vehicle_name: vehicle ? vehicle.vehicle_name : "General Operational Costs",
+      trip_code: trip ? trip.trip_code : "N/A",
+      reference_number: e.receipt_number || "N/A" // alias for frontend table
+    };
+  });
+
+  const search = req.query.search ? String(req.query.search).toLowerCase() : "";
+  if (search) {
+    result = result.filter(item => 
+      item.reference_number?.toLowerCase().includes(search) ||
+      item.receipt_number?.toLowerCase().includes(search) ||
+      item.expense_type?.toLowerCase().includes(search) ||
+      item.description?.toLowerCase().includes(search) ||
+      item.vehicle_name?.toLowerCase().includes(search) ||
+      item.vehicle_reg?.toLowerCase().includes(search)
+    );
+  }
+
+  res.json(result);
+});
+
+apiRouter.post("/expenses", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FINANCIAL_ANALYST, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
+  const {
+    vehicle_id,
+    trip_id,
+    expense_type,
+    amount,
+    expense_date,
+    description
+  } = req.body;
+
+  const reference_number = req.body.reference_number || req.body.receipt_number;
+
+  if (!expense_type || amount === undefined || !expense_date || !description || !reference_number) {
+    return res.status(400).json({ error: "Missing required expense details." });
+  }
+
+  const valAmount = Number(amount);
+  if (valAmount < 0) {
+    return res.status(400).json({ error: "Expense amount cannot be negative." });
+  }
+
+  // Enforce validation: must associate vehicle or trip if relevant
+  if (!vehicle_id && !trip_id) {
+    return res.status(400).json({ error: "An expense must be associated with either a vehicle or a trip." });
+  }
+
+  const exp: Expense = {
+    id: "ex_" + Math.random().toString(36).substr(2, 9),
+    vehicle_id: vehicle_id || undefined,
+    trip_id: trip_id || undefined,
+    expense_type: expense_type as ExpenseType,
+    amount: valAmount,
+    expense_date,
+    description,
+    receipt_number: reference_number,
+    created_by: req.user!.id,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  db.expenses.unshift(exp);
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Logged ${exp.expense_type} expense of Rs. ${exp.amount}`,
+    "EXPENSE",
+    exp.id
+  );
+
+  res.status(201).json({
+    ...exp,
+    reference_number: exp.receipt_number
+  });
+});
+
+apiRouter.delete("/expenses/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
+  const index = db.expenses.findIndex(e => e.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: "Expense record not found." });
+
+  const record = db.expenses[index];
+  db.expenses.splice(index, 1);
+  db.save();
+
+  db.logActivity(
+    req.user!.id,
+    req.user!.full_name,
+    `Deleted expense log of Rs. ${record.amount}`,
+    "EXPENSE",
+    record.id
+  );
+
+  res.json({ success: true });
+});
+
+
+// ============================================================================
+// 8. DASHBOARD ANALYTICS ENDPOINTS
+// ============================================================================
+
+apiRouter.get("/dashboard/summary", authenticateJWT, (req, res) => {
+  const totalVehicles = db.vehicles.length;
+  const nonRetiredVehicles = db.vehicles.filter(v => v.status !== VehicleStatus.RETIRED).length;
+  const availableVehicles = db.vehicles.filter(v => v.status === VehicleStatus.AVAILABLE).length;
+  const onTripVehicles = db.vehicles.filter(v => v.status === VehicleStatus.ON_TRIP).length;
+  const inMaintenanceVehicles = db.vehicles.filter(v => v.status === VehicleStatus.IN_SHOP).length;
+
+  const totalDrivers = db.drivers.length;
+  const availableDrivers = db.drivers.filter(d => d.status === DriverStatus.AVAILABLE).length;
+  const onTripDrivers = db.drivers.filter(d => d.status === DriverStatus.ON_TRIP).length;
+
+  const activeTrips = db.trips.filter(t => t.status === TripStatus.DISPATCHED).length;
+  const draftTrips = db.trips.filter(t => t.status === TripStatus.DRAFT).length;
+
+  // Fleet utilization formula: Vehicles On Trip / Non-Retired Vehicles * 100
+  const utilization = nonRetiredVehicles > 0 ? (onTripVehicles / nonRetiredVehicles) * 100 : 0;
+
+  // Financial math (all-time or monthly)
+  const totalFuelCost = db.fuel_logs.reduce((sum, f) => sum + f.fuel_cost, 0);
+  const totalMaintenanceCost = db.maintenance_logs.reduce((sum, m) => sum + (m.actual_cost || 0), 0);
+  const totalOtherExpenses = db.expenses.filter(e => e.expense_type !== ExpenseType.MAINTENANCE).reduce((sum, e) => sum + e.amount, 0);
+
+  const totalOperationalCost = totalFuelCost + totalMaintenanceCost + totalOtherExpenses;
+
+  res.json({
+    kpi: {
+      totalVehicles,
+      availableVehicles,
+      onTripVehicles,
+      inMaintenanceVehicles,
+      totalDrivers,
+      availableDrivers,
+      onTripDrivers,
+      activeTrips,
+      draftTrips,
+      fleetUtilization: Math.round(utilization),
+      totalFuelCost,
+      totalMaintenanceCost,
+      totalOperationalCost
+    }
+  });
+});
+
+apiRouter.get("/dashboard/vehicle-status", authenticateJWT, (req, res) => {
+  const statuses = [VehicleStatus.AVAILABLE, VehicleStatus.ON_TRIP, VehicleStatus.IN_SHOP, VehicleStatus.RETIRED];
+  const distribution = statuses.map(st => {
+    const count = db.vehicles.filter(v => v.status === st).length;
+    return { name: st.replace("_", " "), value: count };
+  });
+  res.json(distribution);
+});
+
+apiRouter.get("/dashboard/trip-status", authenticateJWT, (req, res) => {
+  const statuses = [TripStatus.DRAFT, TripStatus.DISPATCHED, TripStatus.COMPLETED, TripStatus.CANCELLED];
+  const distribution = statuses.map(st => {
+    const count = db.trips.filter(t => t.status === st).length;
+    return { name: st, value: count };
+  });
+  res.json(distribution);
+});
+
+apiRouter.get("/dashboard/monthly-costs", authenticateJWT, (req, res) => {
+  // Return costs grouped by type for charts
+  const fuel = db.fuel_logs.reduce((sum, f) => sum + f.fuel_cost, 0);
+  const maintenance = db.maintenance_logs.reduce((sum, m) => sum + (m.actual_cost || 0), 0);
+  const others = db.expenses.reduce((sum, e) => sum + e.amount, 0) - fuel; // prevent double counting fuel in expenses
+
+  res.json([
+    { name: "Fuel Logs", cost: fuel },
+    { name: "Maintenance", cost: maintenance },
+    { name: "Other Expenses", cost: Math.max(0, others) }
+  ]);
+});
+
+apiRouter.get("/dashboard/fuel-efficiency", authenticateJWT, (req, res) => {
+  // Fuel Efficiency: Distance / fuel_consumed
+  const vehiclesWithTrips = db.vehicles.map(v => {
+    const vTrips = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
+    let totalDist = 0;
+    let totalFuel = 0;
+
+    vTrips.forEach(t => {
+      totalDist += t.actual_distance || 0;
+      totalFuel += t.fuel_consumed || 0;
+    });
+
+    const efficiency = totalFuel > 0 ? Number((totalDist / totalFuel).toFixed(2)) : 0;
+    return {
+      vehicle_name: `${v.vehicle_name} (${v.registration_number})`,
+      efficiency
+    };
+  }).filter(item => item.efficiency > 0);
+
+  res.json(vehiclesWithTrips);
+});
+
+apiRouter.get("/dashboard/recent-activity", authenticateJWT, (req, res) => {
+  res.json(db.activity_logs.slice(0, 10)); // Top 10 activities
+});
+
+apiRouter.get("/dashboard/licence-alerts", authenticateJWT, (req, res) => {
+  const today = new Date();
+  const limit30 = new Date(Date.now() + 30 * 86400000);
+  const todayStr = today.toISOString().split("T")[0];
+  const limitStr = limit30.toISOString().split("T")[0];
+
+  const expired = db.drivers.filter(d => d.licence_expiry_date < todayStr).map(d => ({
+    driver_id: d.id,
+    driver_name: d.full_name,
+    licence: d.licence_number,
+    expiry: d.licence_expiry_date,
+    status: "EXPIRED"
+  }));
+
+  const expiring = db.drivers.filter(d => d.licence_expiry_date >= todayStr && d.licence_expiry_date <= limitStr).map(d => ({
+    driver_id: d.id,
+    driver_name: d.full_name,
+    licence: d.licence_number,
+    expiry: d.licence_expiry_date,
+    status: "EXPIRING_SOON"
+  }));
+
+  res.json({
+    expired,
+    expiring_soon: expiring
+  });
+});
+
+
+// ============================================================================
+// 9. REPORTS MODULE ENDPOINTS
+// ============================================================================
+
+apiRouter.get("/reports/vehicle-performance", authenticateJWT, (req, res) => {
+  const list = db.vehicles.map(v => {
+    const vTrips = db.trips.filter(t => t.vehicle_id === v.id);
+    const completed = vTrips.filter(t => t.status === TripStatus.COMPLETED);
+    const distance = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
+    const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
+
+    const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id).reduce((sum, f) => sum + f.fuel_cost, 0);
+    const maintenance = db.maintenance_logs.filter(m => m.vehicle_id === v.id).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
+    const totalCost = fuel + maintenance;
+
+    return {
+      vehicle_id: v.id,
+      registration_number: v.registration_number,
+      vehicle_name: v.vehicle_name,
+      total_trips: vTrips.length,
+      completed_trips: completed.length,
+      total_distance: distance,
+      total_revenue: revenue,
+      operational_cost: totalCost,
+      net_profit: revenue - totalCost
+    };
+  });
+  res.json(list);
+});
+
+apiRouter.get("/reports/fuel-efficiency", authenticateJWT, (req, res) => {
+  const list = db.vehicles.map(v => {
+    const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
+    const dist = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
+    const fuel = completed.reduce((sum, t) => sum + (t.fuel_consumed || 0), 0);
+
+    const efficiency = fuel > 0 ? Number((dist / fuel).toFixed(2)) : 0;
+    return {
+      registration_number: v.registration_number,
+      vehicle_name: v.vehicle_name,
+      completed_trips: completed.length,
+      total_distance: dist,
+      total_fuel_consumed: fuel,
+      efficiency_km_per_litre: efficiency
+    };
+  });
+  res.json(list);
+});
+
+apiRouter.get("/reports/vehicle-roi", authenticateJWT, (req, res) => {
+  // ROI Formula: (Revenue - Operational Cost) / Acquisition Cost
+  const list = db.vehicles.map(v => {
+    const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
+    const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
+
+    const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id).reduce((sum, f) => sum + f.fuel_cost, 0);
+    const maintenance = db.maintenance_logs.filter(m => m.vehicle_id === v.id).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
+    const expenses = db.expenses.filter(e => e.vehicle_id === v.id).reduce((sum, e) => sum + e.amount, 0);
+    const totalCost = fuel + maintenance + expenses;
+
+    const netProfit = revenue - totalCost;
+    const roi = v.acquisition_cost > 0 ? (netProfit / v.acquisition_cost) * 100 : 0;
+
+    return {
+      registration_number: v.registration_number,
+      vehicle_name: v.vehicle_name,
+      acquisition_cost: v.acquisition_cost,
+      total_revenue: revenue,
+      operational_cost: totalCost,
+      net_profit: netProfit,
+      roi_percentage: Number(roi.toFixed(2))
+    };
+  });
+  res.json(list);
+});
+
+apiRouter.get("/reports/summary", authenticateJWT, (req, res) => {
+  const { start_date, end_date, type } = req.query;
+  const start = start_date ? new Date(start_date as string) : null;
+  const end = end_date ? new Date(end_date as string) : null;
+
+  if (start) start.setHours(0, 0, 0, 0);
+  if (end) end.setHours(23, 59, 59, 999);
+
+  const isWithinRange = (dateStr?: string) => {
+    if (!dateStr) return false;
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return false;
+    if (start && d < start) return false;
+    if (end && d > end) return false;
+    return true;
+  };
+
+  if (type === "ROI") {
+    const list = db.vehicles.map(v => {
+      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED && isWithinRange(t.completed_at || t.created_at));
+      const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
+
+      const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id && isWithinRange(f.fuel_date || f.created_at)).reduce((sum, f) => sum + f.fuel_cost, 0);
+      const maintenance = db.maintenance_logs.filter(m => m.vehicle_id === v.id && isWithinRange(m.completed_date || m.start_date || m.created_at)).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
+      const totalCost = fuel + maintenance;
+
+      const netProfit = revenue - totalCost;
+      const roi = v.acquisition_cost > 0 ? (netProfit / v.acquisition_cost) * 100 : 0;
+
+      return {
+        vehicle_id: v.id,
+        registration_number: v.registration_number,
+        vehicle_name: v.vehicle_name,
+        acquisition_cost: v.acquisition_cost || 0,
+        revenue: revenue,
+        fuel_cost: fuel,
+        maintenance_cost: maintenance,
+        net_profit: netProfit,
+        roi: Number(roi.toFixed(2))
+      };
+    });
+    return res.json(list);
+  } else {
+    // type === "FUEL"
+    const list = db.vehicles.map(v => {
+      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED && isWithinRange(t.completed_at || t.created_at));
+      const dist = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
+      const fuel = completed.reduce((sum, t) => sum + (t.fuel_consumed || 0), 0);
+
+      const efficiency = fuel > 0 ? Number((dist / fuel).toFixed(2)) : 0;
+      return {
+        vehicle_id: v.id,
+        registration_number: v.registration_number,
+        vehicle_name: v.vehicle_name,
+        total_distance: dist,
+        total_fuel: fuel,
+        current_odometer: v.odometer || 0,
+        efficiency: efficiency
+      };
+    });
+    return res.json(list);
+  }
+});
+
+apiRouter.get("/reports/download", authenticateJWT, (req, res) => {
+  const { start_date, end_date, type } = req.query;
+  const start = start_date ? new Date(start_date as string) : null;
+  const end = end_date ? new Date(end_date as string) : null;
+
+  if (start) start.setHours(0, 0, 0, 0);
+  if (end) end.setHours(23, 59, 59, 999);
+
+  const isWithinRange = (dateStr?: string) => {
+    if (!dateStr) return false;
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return false;
+    if (start && d < start) return false;
+    if (end && d > end) return false;
+    return true;
+  };
+
+  let csvContent = "";
+
+  if (type === "ROI") {
+    csvContent += "Registration,Vehicle Name,Acquisition Cost (Rs.),Total Revenue (Rs.),Total Fuel Cost (Rs.),Servicing Cost (Rs.),Net Profit (Rs.),ROI (%)\n";
+    db.vehicles.forEach(v => {
+      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED && isWithinRange(t.completed_at || t.created_at));
+      const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
+      const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id && isWithinRange(f.fuel_date || f.created_at)).reduce((sum, f) => sum + f.fuel_cost, 0);
+      const mnt = db.maintenance_logs.filter(m => m.vehicle_id === v.id && isWithinRange(m.completed_date || m.start_date || m.created_at)).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
+      const cost = fuel + mnt;
+      const netProfit = revenue - cost;
+      const roi = v.acquisition_cost > 0 ? ((netProfit / v.acquisition_cost) * 100).toFixed(1) : "0.0";
+      csvContent += `"${v.registration_number}","${v.vehicle_name}",${v.acquisition_cost || 0},${revenue},${fuel},${mnt},${netProfit},${roi}%\n`;
+    });
+  } else {
+    csvContent += "Registration,Vehicle Name,Total Distance (km),Total Fuel Consumed (L),Current Odometer (km),Efficiency (km/L)\n";
+    db.vehicles.forEach(v => {
+      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED && isWithinRange(t.completed_at || t.created_at));
+      const dist = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
+      const fuel = completed.reduce((sum, t) => sum + (t.fuel_consumed || 0), 0);
+      const eff = fuel > 0 ? (dist / fuel).toFixed(2) : "0.00";
+      csvContent += `"${v.registration_number}","${v.vehicle_name}",${dist},${fuel},${v.odometer || 0},${eff}\n`;
+    });
+  }
+
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", `attachment; filename=transitops-${type || "report"}-${new Date().toISOString().split("T")[0]}.csv`);
+  res.status(200).send(csvContent);
+});
+
+apiRouter.get("/reports/export/csv", authenticateJWT, (req, res) => {
+  const { type } = req.query;
+
+  let csvContent = "";
+
+  if (type === "vehicle-performance") {
+    csvContent += "Registration,Vehicle Name,Total Trips,Total Distance (km),Total Revenue (Rs.),Operational Cost (Rs.),Net Profit (Rs.)\n";
+    db.vehicles.forEach(v => {
+      const vTrips = db.trips.filter(t => t.vehicle_id === v.id);
+      const completed = vTrips.filter(t => t.status === TripStatus.COMPLETED);
+      const distance = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
+      const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
+      const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id).reduce((sum, f) => sum + f.fuel_cost, 0);
+      const mnt = db.maintenance_logs.filter(m => m.vehicle_id === v.id).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
+      const cost = fuel + mnt;
+      csvContent += `"${v.registration_number}","${v.vehicle_name}",${vTrips.length},${distance},${revenue},${cost},${revenue - cost}\n`;
+    });
+  } else if (type === "fuel-efficiency") {
+    csvContent += "Registration,Vehicle Name,Completed Trips,Total Distance (km),Fuel Consumed (L),Efficiency (km/L)\n";
+    db.vehicles.forEach(v => {
+      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
+      const dist = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
+      const fuel = completed.reduce((sum, t) => sum + (t.fuel_consumed || 0), 0);
+      const eff = fuel > 0 ? (dist / fuel).toFixed(2) : "0.00";
+      csvContent += `"${v.registration_number}","${v.vehicle_name}",${completed.length},${dist},${fuel},${eff}\n`;
+    });
+  } else {
+    csvContent += "Operational Overview Report\n";
+    csvContent += `Total Vehicles,${db.vehicles.length}\n`;
+    csvContent += `Total Drivers,${db.drivers.length}\n`;
+    csvContent += `Total Trips Logged,${db.trips.length}\n`;
+    csvContent += `Total Expenses Logged,${db.expenses.reduce((sum, e) => sum + e.amount, 0)}\n`;
+  }
+
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", `attachment; filename=transitops-${type || "report"}-${new Date().toISOString().split("T")[0]}.csv`);
+  res.status(200).send(csvContent);
+});
+
+
+// ============================================================================
+// 10. NOTIFICATIONS ENDPOINTS
+// ============================================================================
+
+apiRouter.get("/notifications", authenticateJWT, (req: AuthenticatedRequest, res) => {
+  let list = db.notifications;
+
+  // Filter by user role/view rights or specific user
+  // If Driver: only show their notifications
+  if (req.user?.role === UserRole.DRIVER) {
+    list = list.filter(n => n.user_id === req.user!.id);
+  } else {
+    // Other roles view system notifications + notifications for their user ID
+    list = list.filter(n => n.user_id === req.user!.id || n.user_id === "all" || n.notification_type === NotificationType.SYSTEM);
+  }
+
+  res.json(list);
+});
+
+apiRouter.patch("/notifications/:id/read", authenticateJWT, (req, res) => {
+  const notif = db.notifications.find(n => n.id === req.params.id);
+  if (!notif) return res.status(404).json({ error: "Notification not found." });
+
+  notif.is_read = true;
+  db.save();
+
+  res.json({ success: true, notification: notif });
+});
+
+apiRouter.patch("/notifications/read-all", authenticateJWT, (req: AuthenticatedRequest, res) => {
+  db.notifications.forEach(n => {
+    if (n.user_id === req.user!.id || n.user_id === "all") {
+      n.is_read = true;
+    }
+  });
+  db.save();
+  res.json({ success: true });
+});
+
+export { apiRouter };
