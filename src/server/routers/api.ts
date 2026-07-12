@@ -1565,258 +1565,1194 @@ apiRouter.delete(
 // 4. DRIVER MODULE ENDPOINTS
 // ============================================================================
 
+type DriverSortField =
+  | "created_at"
+  | "full_name"
+  | "licence_number"
+  | "licence_expiry_date"
+  | "safety_score"
+  | "region"
+  | "status";
+
+type LicenceState =
+  | "VALID"
+  | "EXPIRING_SOON"
+  | "EXPIRED";
+
+const DRIVER_SORT_FIELDS = new Set<DriverSortField>([
+  "created_at",
+  "full_name",
+  "licence_number",
+  "licence_expiry_date",
+  "safety_score",
+  "region",
+  "status",
+]);
+
+const DRIVER_PROFILE_WRITE_ROLES = [
+  UserRole.ADMIN,
+  UserRole.DISPATCHER,
+  UserRole.SAFETY_OFFICER,
+];
+
+const DRIVER_SANCTION_ROLES = [
+  UserRole.ADMIN,
+  UserRole.SAFETY_OFFICER,
+];
+
+const DRIVER_LICENCE_PATTERN =
+  /^[A-Z0-9/-]{4,30}$/;
+const DRIVER_CONTACT_PATTERN =
+  /^[0-9+()\- ]{7,20}$/;
+
+function normalizeDriverText(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function normalizeDriverLicence(value: string): string {
+  return value
+    .trim()
+    .replace(/\s+/g, "")
+    .toUpperCase();
+}
+
+function isDriverStatus(
+  value: unknown,
+): value is DriverStatus {
+  return (
+    typeof value === "string" &&
+    Object.values(DriverStatus).includes(
+      value as DriverStatus,
+    )
+  );
+}
+
+function isIsoDate(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(value)
+  ) {
+    return false;
+  }
+
+  const [year, month, day] = value
+    .split("-")
+    .map(Number);
+  const date = new Date(
+    Date.UTC(year, month - 1, day),
+  );
+
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+  );
+}
+
+function getTodayDate(): string {
+  return new Date().toISOString().split("T")[0];
+}
+
+function getLicenceLimitDate(): string {
+  const limit = new Date();
+  limit.setUTCDate(limit.getUTCDate() + 30);
+  return limit.toISOString().split("T")[0];
+}
+
+function getDriverLicenceState(
+  expiryDate: string,
+): LicenceState {
+  if (expiryDate < getTodayDate()) {
+    return "EXPIRED";
+  }
+
+  if (expiryDate <= getLicenceLimitDate()) {
+    return "EXPIRING_SOON";
+  }
+
+  return "VALID";
+}
+
+function compareDriverValues(
+  first: Driver,
+  second: Driver,
+  field: DriverSortField,
+  order: 1 | -1,
+): number {
+  const firstValue = first[field];
+  const secondValue = second[field];
+
+  if (
+    typeof firstValue === "number" &&
+    typeof secondValue === "number"
+  ) {
+    return (firstValue - secondValue) * order;
+  }
+
+  return (
+    String(firstValue).localeCompare(
+      String(secondValue),
+      undefined,
+      {
+        numeric: true,
+        sensitivity: "base",
+      },
+    ) * order
+  );
+}
+
+function serializeDriverProfile(driver: Driver) {
+  const linkedUser = driver.user_id
+    ? db.users.find(
+        (user) => user.id === driver.user_id,
+      )
+    : undefined;
+
+  return {
+    ...driver,
+    licence_status: getDriverLicenceState(
+      driver.licence_expiry_date,
+    ),
+    linked_user: linkedUser
+      ? {
+          id: linkedUser.id,
+          full_name: linkedUser.full_name,
+          email: linkedUser.email,
+          is_active: linkedUser.is_active,
+        }
+      : null,
+  };
+}
+
+function validateDriverUserLink(
+  requestedUserId: unknown,
+  currentDriverId?: string,
+):
+  | { userId: string | undefined }
+  | { error: string; status: number } {
+  if (
+    requestedUserId === null ||
+    requestedUserId === undefined ||
+    requestedUserId === ""
+  ) {
+    return { userId: undefined };
+  }
+
+  if (typeof requestedUserId !== "string") {
+    return {
+      error: "Linked user ID must be a string or null.",
+      status: 400,
+    };
+  }
+
+  const user = db.users.find(
+    (candidate) => candidate.id === requestedUserId,
+  );
+
+  if (!user) {
+    return {
+      error: "Selected driver login account was not found.",
+      status: 400,
+    };
+  }
+
+  if (!user.is_active) {
+    return {
+      error: "A disabled account cannot be linked to a driver profile.",
+      status: 409,
+    };
+  }
+
+  if (user.role !== UserRole.DRIVER) {
+    return {
+      error: "Only accounts with the Driver role can be linked.",
+      status: 409,
+    };
+  }
+
+  const existingLink = db.drivers.find(
+    (driver) =>
+      driver.id !== currentDriverId &&
+      driver.user_id === user.id,
+  );
+
+  if (existingLink) {
+    return {
+      error: "This login account is already linked to another driver profile.",
+      status: 409,
+    };
+  }
+
+  return { userId: user.id };
+}
+
 apiRouter.get(
   "/drivers/available",
   authenticateJWT,
   requireRole(DRIVER_READ_ROLES),
+  (_req, res) => {
+    const result = db.drivers
+      .filter(
+        (driver) =>
+          driver.status ===
+            DriverStatus.AVAILABLE &&
+          getDriverLicenceState(
+            driver.licence_expiry_date,
+          ) !== "EXPIRED",
+      )
+      .sort((first, second) =>
+        first.full_name.localeCompare(
+          second.full_name,
+          undefined,
+          { sensitivity: "base" },
+        ),
+      );
+
+    return res.json(result);
+  },
+);
+
+apiRouter.get(
+  "/drivers/linkable-users",
+  authenticateJWT,
+  requireRole([UserRole.ADMIN]),
   (req, res) => {
-  // available and licence is valid
-  const todayStr = new Date().toISOString().split("T")[0];
-  const list = db.drivers.filter(
-    d => d.status === DriverStatus.AVAILABLE && d.licence_expiry_date >= todayStr
-  );
-  res.json(list);
-});
+    const includeUserId = getSingleQueryValue(
+      req.query.include_user_id,
+    );
+    const linkedUserIds = new Set(
+      db.drivers
+        .map((driver) => driver.user_id)
+        .filter((userId): userId is string =>
+          Boolean(userId),
+        ),
+    );
+
+    const users = db.users
+      .filter(
+        (user) =>
+          user.role === UserRole.DRIVER &&
+          user.is_active &&
+          (!linkedUserIds.has(user.id) ||
+            user.id === includeUserId),
+      )
+      .map((user) => ({
+        id: user.id,
+        full_name: user.full_name,
+        email: user.email,
+        is_active: user.is_active,
+      }))
+      .sort((first, second) =>
+        first.full_name.localeCompare(
+          second.full_name,
+          undefined,
+          { sensitivity: "base" },
+        ),
+      );
+
+    return res.json(users);
+  },
+);
 
 apiRouter.get(
   "/drivers",
   authenticateJWT,
   requireRole(DRIVER_READ_ROLES),
   (req, res) => {
-  const { search, status, licence_status, region } = req.query;
-
-  let list = [...db.drivers];
-
-  // Search
-  if (search) {
-    const q = (search as string).toLowerCase();
-    list = list.filter(
-      d =>
-        d.full_name.toLowerCase().includes(q) ||
-        d.licence_number.toLowerCase().includes(q) ||
-        d.contact_number.includes(q)
+    const search = getSingleQueryValue(
+      req.query.search,
+    ).toLowerCase();
+    const status = getSingleQueryValue(
+      req.query.status,
     );
-  }
+    const licenceStatus = getSingleQueryValue(
+      req.query.licence_status,
+    );
+    const region = getSingleQueryValue(
+      req.query.region,
+    ).toLowerCase();
+    const requestedSortField =
+      getSingleQueryValue(req.query.sort_by) ||
+      "created_at";
+    const requestedSortOrder =
+      getSingleQueryValue(req.query.sort_order) ||
+      "desc";
 
-  // Filters
-  if (status) {
-    list = list.filter(d => d.status === status);
-  }
-
-  if (region) {
-    list = list.filter(d => d.region.toLowerCase() === (region as string).toLowerCase());
-  }
-
-  if (licence_status) {
-    const today = new Date();
-    const limit30 = new Date(Date.now() + 30 * 86400000);
-    const todayStr = today.toISOString().split("T")[0];
-    const limitStr = limit30.toISOString().split("T")[0];
-
-    if (licence_status === "VALID") {
-      list = list.filter(d => d.licence_expiry_date > limitStr);
-    } else if (licence_status === "EXPIRING_SOON") {
-      list = list.filter(d => d.licence_expiry_date >= todayStr && d.licence_expiry_date <= limitStr);
-    } else if (licence_status === "EXPIRED") {
-      list = list.filter(d => d.licence_expiry_date < todayStr);
+    if (status && !isDriverStatus(status)) {
+      return res.status(400).json({
+        error: "Invalid driver status filter.",
+      });
     }
-  }
 
-  // Sort by safety score descending by default
-  list.sort((a, b) => b.safety_score - a.safety_score);
+    if (
+      licenceStatus &&
+      ![
+        "VALID",
+        "EXPIRING_SOON",
+        "EXPIRED",
+      ].includes(licenceStatus)
+    ) {
+      return res.status(400).json({
+        error: "Invalid licence status filter.",
+      });
+    }
 
-  res.json(list);
-});
+    if (
+      !DRIVER_SORT_FIELDS.has(
+        requestedSortField as DriverSortField,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Invalid driver sort field.",
+      });
+    }
+
+    if (
+      requestedSortOrder !== "asc" &&
+      requestedSortOrder !== "desc"
+    ) {
+      return res.status(400).json({
+        error: "Driver sort order must be asc or desc.",
+      });
+    }
+
+    let list = [...db.drivers];
+
+    if (search) {
+      list = list.filter((driver) =>
+        [
+          driver.full_name,
+          driver.licence_number,
+          driver.contact_number,
+          driver.licence_category,
+          driver.region,
+        ].some((value) =>
+          value.toLowerCase().includes(search),
+        ),
+      );
+    }
+
+    if (status) {
+      list = list.filter(
+        (driver) => driver.status === status,
+      );
+    }
+
+    if (licenceStatus) {
+      list = list.filter(
+        (driver) =>
+          getDriverLicenceState(
+            driver.licence_expiry_date,
+          ) === licenceStatus,
+      );
+    }
+
+    if (region) {
+      list = list.filter((driver) =>
+        driver.region.toLowerCase().includes(region),
+      );
+    }
+
+    const sortField =
+      requestedSortField as DriverSortField;
+    const sortOrder: 1 | -1 =
+      requestedSortOrder === "asc" ? 1 : -1;
+
+    list.sort((first, second) =>
+      compareDriverValues(
+        first,
+        second,
+        sortField,
+        sortOrder,
+      ),
+    );
+
+    const pageSize = parsePositiveInteger(
+      req.query.page_size,
+      15,
+      100,
+    );
+    const requestedPage = parsePositiveInteger(
+      req.query.page,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const total = list.length;
+    const totalPages = Math.max(
+      1,
+      Math.ceil(total / pageSize),
+    );
+    const page = Math.min(
+      requestedPage,
+      totalPages,
+    );
+    const startIndex = (page - 1) * pageSize;
+    const data = list.slice(
+      startIndex,
+      startIndex + pageSize,
+    );
+
+    return res.json({
+      data,
+      total,
+      page,
+      page_size: pageSize,
+      total_pages: totalPages,
+    });
+  },
+);
+
+apiRouter.get(
+  "/drivers/:id/history",
+  authenticateJWT,
+  requireRole(DRIVER_READ_ROLES),
+  (req, res) => {
+    const driver = db.drivers.find(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
+
+    if (!driver) {
+      return res.status(404).json({
+        error: "Driver not found.",
+      });
+    }
+
+    const trips = db.trips
+      .filter(
+        (trip) => trip.driver_id === driver.id,
+      )
+      .sort((first, second) =>
+        second.created_at.localeCompare(
+          first.created_at,
+        ),
+      )
+      .map((trip) => {
+        const vehicle = db.vehicles.find(
+          (candidate) =>
+            candidate.id === trip.vehicle_id,
+        );
+
+        return {
+          ...trip,
+          vehicle_name:
+            vehicle?.vehicle_name ??
+            "Unknown Vehicle",
+          vehicle_registration:
+            vehicle?.registration_number ?? "N/A",
+        };
+      });
+
+    const completedTrips = trips.filter(
+      (trip) =>
+        trip.status === TripStatus.COMPLETED,
+    );
+
+    return res.json({
+      trips,
+      summary: {
+        total_trips: trips.length,
+        active_trips: trips.filter(
+          (trip) =>
+            trip.status === TripStatus.DISPATCHED,
+        ).length,
+        completed_trips: completedTrips.length,
+        cancelled_trips: trips.filter(
+          (trip) =>
+            trip.status === TripStatus.CANCELLED,
+        ).length,
+        total_distance: completedTrips.reduce(
+          (sum, trip) =>
+            sum + (trip.actual_distance ?? 0),
+          0,
+        ),
+      },
+    });
+  },
+);
 
 apiRouter.get(
   "/drivers/:id",
   authenticateJWT,
   requireRole(DRIVER_READ_ROLES),
   (req, res) => {
-  const driver = db.drivers.find(d => d.id === req.params.id);
-  if (!driver) return res.status(404).json({ error: "Driver not found." });
-  res.json(driver);
-});
+    const driver = db.drivers.find(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
 
-apiRouter.post("/drivers", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER, UserRole.SAFETY_OFFICER]), (req: AuthenticatedRequest, res) => {
-  const {
-    full_name,
-    licence_number,
-    licence_category,
-    licence_expiry_date,
-    contact_number,
-    safety_score,
-    region,
-    status
-  } = req.body;
-
-  if (!full_name || !licence_number || !licence_expiry_date || !contact_number) {
-    return res.status(400).json({ error: "Missing required fields." });
-  }
-
-  const existing = db.drivers.find(d => d.licence_number.toUpperCase() === licence_number.toUpperCase());
-  if (existing) {
-    return res.status(400).json({ error: "Licence number must be unique." });
-  }
-
-  const score = safety_score !== undefined ? Number(safety_score) : 100;
-  if (score < 0 || score > 100) {
-    return res.status(400).json({ error: "Safety score must be between 0 and 100." });
-  }
-
-  const newDriver: Driver = {
-    id: "dr_" + Math.random().toString(36).substr(2, 9),
-    full_name,
-    licence_number: licence_number.toUpperCase(),
-    licence_category: licence_category || "Heavy Commercial",
-    licence_expiry_date,
-    contact_number,
-    safety_score: score,
-    region: region || "Patna",
-    status: (status as DriverStatus) || DriverStatus.AVAILABLE,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
-
-  db.drivers.push(newDriver);
-  db.save();
-
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Registered driver ${newDriver.full_name} (${newDriver.licence_number})`,
-    "DRIVER",
-    newDriver.id
-  );
-
-  res.status(201).json(newDriver);
-});
-
-apiRouter.put("/drivers/:id", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER, UserRole.SAFETY_OFFICER]), (req: AuthenticatedRequest, res) => {
-  const driver = db.drivers.find(d => d.id === req.params.id);
-  if (!driver) return res.status(404).json({ error: "Driver not found." });
-
-  const {
-    full_name,
-    licence_number,
-    licence_category,
-    licence_expiry_date,
-    contact_number,
-    safety_score,
-    region,
-    status
-  } = req.body;
-
-  if (licence_number) {
-    const existing = db.drivers.find(d => d.id !== driver.id && d.licence_number.toUpperCase() === licence_number.toUpperCase());
-    if (existing) {
-      return res.status(400).json({ error: "Licence number must be unique." });
+    if (!driver) {
+      return res.status(404).json({
+        error: "Driver not found.",
+      });
     }
-    driver.licence_number = licence_number.toUpperCase();
-  }
 
-  if (safety_score !== undefined) {
-    const score = Number(safety_score);
-    if (score < 0 || score > 100) {
-      return res.status(400).json({ error: "Safety score must be between 0 and 100." });
+    return res.json(serializeDriverProfile(driver));
+  },
+);
+
+apiRouter.post(
+  "/drivers",
+  authenticateJWT,
+  requireRole(DRIVER_PROFILE_WRITE_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const body = req.body ?? {};
+
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error: "A valid driver payload is required.",
+      });
     }
-    driver.safety_score = score;
-  }
 
-  if (full_name) driver.full_name = full_name;
-  if (licence_category) driver.licence_category = licence_category;
-  if (licence_expiry_date) driver.licence_expiry_date = licence_expiry_date;
-  if (contact_number) driver.contact_number = contact_number;
-  if (region) driver.region = region;
-  if (status && Object.values(DriverStatus).includes(status)) {
-    driver.status = status as DriverStatus;
-  }
+    const fullName =
+      typeof body.full_name === "string"
+        ? normalizeDriverText(body.full_name)
+        : "";
+    const licenceNumber =
+      typeof body.licence_number === "string"
+        ? normalizeDriverLicence(
+            body.licence_number,
+          )
+        : "";
+    const licenceCategory =
+      typeof body.licence_category === "string"
+        ? normalizeDriverText(
+            body.licence_category,
+          )
+        : "";
+    const contactNumber =
+      typeof body.contact_number === "string"
+        ? normalizeDriverText(
+            body.contact_number,
+          )
+        : "";
+    const region =
+      typeof body.region === "string"
+        ? normalizeDriverText(body.region)
+        : "";
+    const safetyScore =
+      body.safety_score === undefined
+        ? 100
+        : parseFiniteNumber(body.safety_score);
+    const requestedStatus =
+      body.status === undefined
+        ? DriverStatus.AVAILABLE
+        : body.status;
 
-  driver.updated_at = new Date().toISOString();
-  db.save();
+    if (
+      fullName.length < 2 ||
+      fullName.length > 80
+    ) {
+      return res.status(400).json({
+        error: "Driver name must contain between 2 and 80 characters.",
+      });
+    }
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Updated driver profile for ${driver.full_name}`,
-    "DRIVER",
-    driver.id
-  );
+    if (
+      !DRIVER_LICENCE_PATTERN.test(
+        licenceNumber,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Licence number must contain 4–30 letters, numbers, slashes, or hyphens.",
+      });
+    }
 
-  res.json(driver);
-});
+    if (
+      licenceCategory.length < 2 ||
+      licenceCategory.length > 60
+    ) {
+      return res.status(400).json({
+        error: "Licence category must contain between 2 and 60 characters.",
+      });
+    }
 
-apiRouter.patch("/drivers/:id/suspend", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.SAFETY_OFFICER]), (req: AuthenticatedRequest, res) => {
-  const driver = db.drivers.find(d => d.id === req.params.id);
-  if (!driver) return res.status(404).json({ error: "Driver not found." });
+    if (!isIsoDate(body.licence_expiry_date)) {
+      return res.status(400).json({
+        error: "A valid licence expiry date is required.",
+      });
+    }
 
-  if (driver.status === DriverStatus.ON_TRIP) {
-    return res.status(400).json({ error: "Cannot suspend a driver currently on trip." });
-  }
+    if (
+      !DRIVER_CONTACT_PATTERN.test(contactNumber)
+    ) {
+      return res.status(400).json({
+        error: "Contact number must contain 7–20 valid phone characters.",
+      });
+    }
 
-  const oldStatus = driver.status;
-  driver.status = DriverStatus.SUSPENDED;
-  driver.updated_at = new Date().toISOString();
-  db.save();
+    if (
+      safetyScore === null ||
+      safetyScore < 0 ||
+      safetyScore > 100
+    ) {
+      return res.status(400).json({
+        error: "Safety score must be between 0 and 100.",
+      });
+    }
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Suspended driver ${driver.full_name}`,
-    "DRIVER",
-    driver.id,
-    oldStatus,
-    DriverStatus.SUSPENDED
-  );
+    if (
+      region.length < 2 ||
+      region.length > 80
+    ) {
+      return res.status(400).json({
+        error: "Region must contain between 2 and 80 characters.",
+      });
+    }
 
-  res.json(driver);
-});
+    if (
+      requestedStatus !== DriverStatus.AVAILABLE &&
+      requestedStatus !== DriverStatus.OFF_DUTY
+    ) {
+      return res.status(400).json({
+        error: "New drivers can only start as Available or Off Duty.",
+      });
+    }
 
-apiRouter.patch("/drivers/:id/activate", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.SAFETY_OFFICER]), (req: AuthenticatedRequest, res) => {
-  const driver = db.drivers.find(d => d.id === req.params.id);
-  if (!driver) return res.status(404).json({ error: "Driver not found." });
+    if (
+      requestedStatus === DriverStatus.AVAILABLE &&
+      getDriverLicenceState(
+        body.licence_expiry_date,
+      ) === "EXPIRED"
+    ) {
+      return res.status(409).json({
+        error: "An expired licence cannot be marked Available.",
+      });
+    }
 
-  const oldStatus = driver.status;
-  driver.status = DriverStatus.AVAILABLE;
-  driver.updated_at = new Date().toISOString();
-  db.save();
+    const duplicateDriver = db.drivers.find(
+      (driver) =>
+        normalizeDriverLicence(
+          driver.licence_number,
+        ) === licenceNumber,
+    );
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Activated driver ${driver.full_name}`,
-    "DRIVER",
-    driver.id,
-    oldStatus,
-    DriverStatus.AVAILABLE
-  );
+    if (duplicateDriver) {
+      return res.status(409).json({
+        error: "Licence number already exists.",
+      });
+    }
 
-  res.json(driver);
-});
+    let linkedUserId: string | undefined;
 
-apiRouter.delete("/drivers/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
-  const index = db.drivers.findIndex(d => d.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Driver not found." });
+    if (hasOwnProperty(body, "user_id")) {
+      if (req.user?.role !== UserRole.ADMIN) {
+        return res.status(403).json({
+          error: "Only an administrator can link driver login accounts.",
+        });
+      }
 
-  const driver = db.drivers[index];
-  if (driver.status === DriverStatus.ON_TRIP) {
-    return res.status(400).json({ error: "Cannot delete a driver while they are On Trip." });
-  }
+      const linkResult = validateDriverUserLink(
+        body.user_id,
+      );
 
-  db.drivers.splice(index, 1);
-  db.save();
+      if ("error" in linkResult) {
+        return res
+          .status(linkResult.status)
+          .json({ error: linkResult.error });
+      }
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Deleted driver ${driver.full_name} (${driver.licence_number})`,
-    "DRIVER",
-    driver.id
-  );
+      linkedUserId = linkResult.userId;
+    }
 
-  res.json({ success: true });
-});
+    const now = new Date().toISOString();
+    const newDriver: Driver = {
+      id: db.generateId("dr"),
+      user_id: linkedUserId,
+      full_name: fullName,
+      licence_number: licenceNumber,
+      licence_category: licenceCategory,
+      licence_expiry_date:
+        body.licence_expiry_date,
+      contact_number: contactNumber,
+      safety_score: safetyScore,
+      region,
+      status: requestedStatus,
+      created_at: now,
+      updated_at: now,
+    };
 
+    db.drivers.push(newDriver);
+
+    try {
+      db.save();
+    } catch (error) {
+      const index = db.drivers.findIndex(
+        (driver) => driver.id === newDriver.id,
+      );
+      if (index >= 0) db.drivers.splice(index, 1);
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Registered driver ${newDriver.full_name} (${newDriver.licence_number})`,
+      "DRIVER",
+      newDriver.id,
+    );
+
+    return res
+      .status(201)
+      .json(serializeDriverProfile(newDriver));
+  },
+);
+
+apiRouter.put(
+  "/drivers/:id",
+  authenticateJWT,
+  requireRole(DRIVER_PROFILE_WRITE_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const driverIndex = db.drivers.findIndex(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
+
+    if (driverIndex === -1) {
+      return res.status(404).json({
+        error: "Driver not found.",
+      });
+    }
+
+    const driver = db.drivers[driverIndex];
+
+    if (driver.status === DriverStatus.ON_TRIP) {
+      return res.status(409).json({
+        error: "Complete or cancel the active trip before editing this driver.",
+      });
+    }
+
+    const body = req.body ?? {};
+
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error: "A valid driver payload is required.",
+      });
+    }
+
+    const editableFields = [
+      "full_name",
+      "licence_number",
+      "licence_category",
+      "licence_expiry_date",
+      "contact_number",
+      "safety_score",
+      "region",
+      "status",
+      "user_id",
+    ] as const;
+
+    if (
+      !editableFields.some((field) =>
+        hasOwnProperty(body, field),
+      )
+    ) {
+      return res.status(400).json({
+        error: "No editable driver fields were supplied.",
+      });
+    }
+
+    const updatedDriver: Driver = { ...driver };
+
+    if (hasOwnProperty(body, "full_name")) {
+      if (typeof body.full_name !== "string") {
+        return res.status(400).json({
+          error: "Driver name must be a string.",
+        });
+      }
+      const fullName = normalizeDriverText(
+        body.full_name,
+      );
+      if (
+        fullName.length < 2 ||
+        fullName.length > 80
+      ) {
+        return res.status(400).json({
+          error: "Driver name must contain between 2 and 80 characters.",
+        });
+      }
+      updatedDriver.full_name = fullName;
+    }
+
+    if (hasOwnProperty(body, "licence_number")) {
+      if (
+        typeof body.licence_number !== "string"
+      ) {
+        return res.status(400).json({
+          error: "Licence number must be a string.",
+        });
+      }
+      const licenceNumber =
+        normalizeDriverLicence(
+          body.licence_number,
+        );
+      if (
+        !DRIVER_LICENCE_PATTERN.test(
+          licenceNumber,
+        )
+      ) {
+        return res.status(400).json({
+          error: "Licence number must contain 4–30 letters, numbers, slashes, or hyphens.",
+        });
+      }
+      const duplicateDriver = db.drivers.find(
+        (candidate) =>
+          candidate.id !== driver.id &&
+          normalizeDriverLicence(
+            candidate.licence_number,
+          ) === licenceNumber,
+      );
+      if (duplicateDriver) {
+        return res.status(409).json({
+          error: "Licence number already exists.",
+        });
+      }
+      updatedDriver.licence_number = licenceNumber;
+    }
+
+    if (
+      hasOwnProperty(body, "licence_category")
+    ) {
+      if (
+        typeof body.licence_category !== "string"
+      ) {
+        return res.status(400).json({
+          error: "Licence category must be a string.",
+        });
+      }
+      const category = normalizeDriverText(
+        body.licence_category,
+      );
+      if (
+        category.length < 2 ||
+        category.length > 60
+      ) {
+        return res.status(400).json({
+          error: "Licence category must contain between 2 and 60 characters.",
+        });
+      }
+      updatedDriver.licence_category = category;
+    }
+
+    if (
+      hasOwnProperty(
+        body,
+        "licence_expiry_date",
+      )
+    ) {
+      if (!isIsoDate(body.licence_expiry_date)) {
+        return res.status(400).json({
+          error: "A valid licence expiry date is required.",
+        });
+      }
+      updatedDriver.licence_expiry_date =
+        body.licence_expiry_date;
+    }
+
+    if (hasOwnProperty(body, "contact_number")) {
+      if (
+        typeof body.contact_number !== "string"
+      ) {
+        return res.status(400).json({
+          error: "Contact number must be a string.",
+        });
+      }
+      const contact = normalizeDriverText(
+        body.contact_number,
+      );
+      if (!DRIVER_CONTACT_PATTERN.test(contact)) {
+        return res.status(400).json({
+          error: "Contact number must contain 7–20 valid phone characters.",
+        });
+      }
+      updatedDriver.contact_number = contact;
+    }
+
+    if (hasOwnProperty(body, "safety_score")) {
+      const score = parseFiniteNumber(
+        body.safety_score,
+      );
+      if (
+        score === null ||
+        score < 0 ||
+        score > 100
+      ) {
+        return res.status(400).json({
+          error: "Safety score must be between 0 and 100.",
+        });
+      }
+      updatedDriver.safety_score = score;
+    }
+
+    if (hasOwnProperty(body, "region")) {
+      if (typeof body.region !== "string") {
+        return res.status(400).json({
+          error: "Region must be a string.",
+        });
+      }
+      const region = normalizeDriverText(body.region);
+      if (
+        region.length < 2 ||
+        region.length > 80
+      ) {
+        return res.status(400).json({
+          error: "Region must contain between 2 and 80 characters.",
+        });
+      }
+      updatedDriver.region = region;
+    }
+
+    if (hasOwnProperty(body, "status")) {
+      if (driver.status === DriverStatus.SUSPENDED) {
+        return res.status(409).json({
+          error: "Use the activation workflow before changing a suspended driver's status.",
+        });
+      }
+
+      if (
+        body.status !== DriverStatus.AVAILABLE &&
+        body.status !== DriverStatus.OFF_DUTY
+      ) {
+        return res.status(400).json({
+          error: "Driver status can only be edited to Available or Off Duty. Use trip or suspension workflows for other statuses.",
+        });
+      }
+      updatedDriver.status = body.status;
+    }
+
+    if (hasOwnProperty(body, "user_id")) {
+      if (req.user?.role !== UserRole.ADMIN) {
+        return res.status(403).json({
+          error: "Only an administrator can link driver login accounts.",
+        });
+      }
+
+      const linkResult = validateDriverUserLink(
+        body.user_id,
+        driver.id,
+      );
+
+      if ("error" in linkResult) {
+        return res
+          .status(linkResult.status)
+          .json({ error: linkResult.error });
+      }
+
+      updatedDriver.user_id = linkResult.userId;
+    }
+
+    if (
+      updatedDriver.status ===
+        DriverStatus.AVAILABLE &&
+      getDriverLicenceState(
+        updatedDriver.licence_expiry_date,
+      ) === "EXPIRED"
+    ) {
+      return res.status(409).json({
+        error: "An expired licence cannot be marked Available. Renew the licence or set the driver Off Duty.",
+      });
+    }
+
+    updatedDriver.updated_at =
+      new Date().toISOString();
+    db.drivers[driverIndex] = updatedDriver;
+
+    try {
+      db.save();
+    } catch (error) {
+      db.drivers[driverIndex] = driver;
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Updated driver profile for ${updatedDriver.full_name}`,
+      "DRIVER",
+      updatedDriver.id,
+    );
+
+    return res.json(
+      serializeDriverProfile(updatedDriver),
+    );
+  },
+);
+
+apiRouter.patch(
+  "/drivers/:id/suspend",
+  authenticateJWT,
+  requireRole(DRIVER_SANCTION_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const driver = db.drivers.find(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
+
+    if (!driver) {
+      return res.status(404).json({
+        error: "Driver not found.",
+      });
+    }
+
+    const hasActiveTrip = db.trips.some(
+      (trip) =>
+        trip.driver_id === driver.id &&
+        trip.status === TripStatus.DISPATCHED,
+    );
+
+    if (
+      driver.status === DriverStatus.ON_TRIP ||
+      hasActiveTrip
+    ) {
+      return res.status(409).json({
+        error: "A driver on an active trip cannot be suspended.",
+      });
+    }
+
+    if (driver.status === DriverStatus.SUSPENDED) {
+      return res.json(serializeDriverProfile(driver));
+    }
+
+    const oldStatus = driver.status;
+    driver.status = DriverStatus.SUSPENDED;
+    driver.updated_at = new Date().toISOString();
+    db.save();
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Suspended driver ${driver.full_name}`,
+      "DRIVER",
+      driver.id,
+      oldStatus,
+      DriverStatus.SUSPENDED,
+    );
+
+    return res.json(serializeDriverProfile(driver));
+  },
+);
+
+apiRouter.patch(
+  "/drivers/:id/activate",
+  authenticateJWT,
+  requireRole(DRIVER_SANCTION_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const driver = db.drivers.find(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
+
+    if (!driver) {
+      return res.status(404).json({
+        error: "Driver not found.",
+      });
+    }
+
+    if (driver.status !== DriverStatus.SUSPENDED) {
+      return res.status(409).json({
+        error: "Only a suspended driver can be activated through this workflow.",
+      });
+    }
+
+    if (
+      getDriverLicenceState(
+        driver.licence_expiry_date,
+      ) === "EXPIRED"
+    ) {
+      return res.status(409).json({
+        error: "Renew the expired licence before activating this driver.",
+      });
+    }
+
+    const oldStatus = driver.status;
+    driver.status = DriverStatus.AVAILABLE;
+    driver.updated_at = new Date().toISOString();
+    db.save();
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Activated driver ${driver.full_name}`,
+      "DRIVER",
+      driver.id,
+      oldStatus,
+      DriverStatus.AVAILABLE,
+    );
+
+    return res.json(serializeDriverProfile(driver));
+  },
+);
+
+apiRouter.delete(
+  "/drivers/:id",
+  authenticateJWT,
+  requireRole([UserRole.ADMIN]),
+  (req: AuthenticatedRequest, res) => {
+    const index = db.drivers.findIndex(
+      (driver) => driver.id === req.params.id,
+    );
+
+    if (index === -1) {
+      return res.status(404).json({
+        error: "Driver not found.",
+      });
+    }
+
+    const driver = db.drivers[index];
+    const activeTrip = db.trips.find(
+      (trip) =>
+        trip.driver_id === driver.id &&
+        trip.status === TripStatus.DISPATCHED,
+    );
+
+    if (
+      driver.status === DriverStatus.ON_TRIP ||
+      activeTrip
+    ) {
+      return res.status(409).json({
+        error: "A driver on an active trip cannot be deleted.",
+      });
+    }
+
+    const tripHistoryCount = db.trips.filter(
+      (trip) => trip.driver_id === driver.id,
+    ).length;
+
+    if (tripHistoryCount > 0) {
+      return res.status(409).json({
+        error: "This driver has trip history and cannot be deleted. Set the profile Off Duty or Suspended instead.",
+        references: {
+          trips: tripHistoryCount,
+        },
+      });
+    }
+
+    db.drivers.splice(index, 1);
+
+    try {
+      db.save();
+    } catch (error) {
+      db.drivers.splice(index, 0, driver);
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Deleted driver ${driver.full_name} (${driver.licence_number})`,
+      "DRIVER",
+      driver.id,
+    );
+
+    return res.json({ success: true });
+  },
+);
 
 // ============================================================================
 // 5. TRIP MODULE ENDPOINTS

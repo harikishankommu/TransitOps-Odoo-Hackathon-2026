@@ -17,6 +17,7 @@ import {
 } from "./context/AuthContext.js";
 
 import { DashboardPage } from "./pages/DashboardPage.js";
+import { DriverDetailsPage } from "./pages/DriverDetailsPage.js";
 import { DriversPage } from "./pages/DriversPage.js";
 import { FuelExpensesPage } from "./pages/FuelExpensesPage.js";
 import { LoginPage } from "./pages/LoginPage.js";
@@ -49,28 +50,26 @@ interface AccessDeniedProps {
 
 const AccessDenied: React.FC<
   AccessDeniedProps
-> = ({
-  onReturnToDashboard,
-}) => (
-  <div className="min-h-[60vh] flex items-center justify-center">
-    <div className="max-w-md w-full border border-red-500/20 bg-red-950/10 p-8 rounded-sm text-center">
-      <div className="text-red-400 text-xs font-mono uppercase tracking-[0.2em] mb-3">
+> = ({ onReturnToDashboard }) => (
+  <div className="flex min-h-[60vh] items-center justify-center">
+    <div className="w-full max-w-md rounded-sm border border-red-500/20 bg-red-950/10 p-8 text-center">
+      <div className="mb-3 font-mono text-xs uppercase tracking-[0.2em] text-red-400">
         Access Restricted
       </div>
 
-      <h2 className="text-2xl font-bold text-white mb-3">
+      <h2 className="mb-3 text-2xl font-bold text-white">
         You cannot access this module
       </h2>
 
-      <p className="text-sm text-white/50 leading-6 mb-6">
-        Your current TransitOps role does not
-        include permission to open this page.
+      <p className="mb-6 text-sm leading-6 text-white/50">
+        Your current TransitOps role does not include
+        permission to open this page.
       </p>
 
       <button
         type="button"
         onClick={onReturnToDashboard}
-        className="px-5 py-2.5 bg-white text-black text-xs font-bold uppercase tracking-wider rounded-sm"
+        className="rounded-sm bg-white px-5 py-2.5 text-xs font-bold uppercase tracking-wider text-black"
       >
         Return to Dashboard
       </button>
@@ -88,47 +87,37 @@ const AppContent: React.FC = () => {
 
   const [currentTab, setCurrentTab] =
     useState<AppTab>(DEFAULT_TAB);
-
   const [showSignup, setShowSignup] =
     useState(false);
+  const [notificationsCount, setNotificationsCount] =
+    useState(0);
 
-  const [
-    notificationsCount,
-    setNotificationsCount,
-  ] = useState(0);
+  const [selectedVehicleId, setSelectedVehicleId] =
+    useState<string | null>(null);
+  const [selectedDriverId, setSelectedDriverId] =
+    useState<string | null>(null);
+  const [selectedTripId, setSelectedTripId] =
+    useState<string | null>(null);
 
-  const [
-    selectedVehicleId,
-    setSelectedVehicleId,
-  ] = useState<string | null>(null);
+  const syncBadgeCount = useCallback(async () => {
+    if (!isAuthenticated) {
+      setNotificationsCount(0);
+      return;
+    }
 
-  const [
-    selectedTripId,
-    setSelectedTripId,
-  ] = useState<string | null>(null);
-
-  const syncBadgeCount =
-    useCallback(async () => {
-      if (!isAuthenticated) {
-        setNotificationsCount(0);
-        return;
-      }
-
-      try {
-        const data =
-          await apiFetch<NotificationCountResponse>(
-            "/notifications/count",
-          );
-
-        setNotificationsCount(
-          Number.isFinite(data.count)
-            ? data.count
-            : 0,
+    try {
+      const data =
+        await apiFetch<NotificationCountResponse>(
+          "/notifications/count",
         );
-      } catch {
-        setNotificationsCount(0);
-      }
-    }, [isAuthenticated]);
+
+      setNotificationsCount(
+        Number.isFinite(data.count) ? data.count : 0,
+      );
+    } catch {
+      setNotificationsCount(0);
+    }
+  }, [isAuthenticated]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -137,41 +126,29 @@ const AppContent: React.FC = () => {
 
     void syncBadgeCount();
 
-    const intervalId = window.setInterval(
-      () => {
-        void syncBadgeCount();
-      },
-      12_000,
-    );
+    const intervalId = window.setInterval(() => {
+      void syncBadgeCount();
+    }, 12_000);
 
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [
-    isAuthenticated,
-    syncBadgeCount,
-  ]);
+  }, [isAuthenticated, syncBadgeCount]);
 
   useEffect(() => {
-    if (
-      !user ||
-      canAccessTab(user.role, currentTab)
-    ) {
+    if (!user || canAccessTab(user.role, currentTab)) {
       return;
     }
 
     setSelectedVehicleId(null);
+    setSelectedDriverId(null);
     setSelectedTripId(null);
-  }, [
-    currentTab,
-    user,
-  ]);
+  }, [currentTab, user]);
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center text-slate-400 space-y-4">
-        <div className="w-12 h-12 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin" />
-
+      <div className="flex min-h-screen flex-col items-center justify-center space-y-4 bg-slate-950 text-slate-400">
+        <div className="h-12 w-12 animate-spin rounded-full border-4 border-emerald-500 border-t-transparent" />
         <p className="font-mono text-xs uppercase tracking-wider">
           Verifying Session State...
         </p>
@@ -183,207 +160,194 @@ const AppContent: React.FC = () => {
     if (showSignup) {
       return (
         <SignupPage
-          onLoginClick={() =>
-            setShowSignup(false)
-          }
+          onLoginClick={() => setShowSignup(false)}
         />
       );
     }
 
     return (
       <LoginPage
-        onRegisterClick={() =>
-          setShowSignup(true)
-        }
+        onRegisterClick={() => setShowSignup(true)}
       />
     );
   }
 
-  const handleTabChange = (
-    tab: AppTab,
-  ): void => {
+  const resetDetailViews = (): void => {
+    setSelectedVehicleId(null);
+    setSelectedDriverId(null);
+    setSelectedTripId(null);
+  };
+
+  const handleTabChange = (tab: AppTab): void => {
     if (!canAccessTab(user.role, tab)) {
       return;
     }
 
     setCurrentTab(tab);
-    setSelectedVehicleId(null);
-    setSelectedTripId(null);
+    resetDetailViews();
   };
 
   const handleViewVehicleDetails = (
     vehicleId: string,
   ): void => {
-    if (
-      !canAccessTab(
-        user.role,
-        "vehicles",
-      )
-    ) {
+    if (!canAccessTab(user.role, "vehicles")) {
       return;
     }
 
     setSelectedVehicleId(vehicleId);
+    setSelectedDriverId(null);
+    setSelectedTripId(null);
     setCurrentTab("vehicles");
+  };
+
+  const handleViewDriverDetails = (
+    driverId: string,
+  ): void => {
+    if (!canAccessTab(user.role, "drivers")) {
+      return;
+    }
+
+    setSelectedDriverId(driverId);
+    setSelectedVehicleId(null);
+    setSelectedTripId(null);
+    setCurrentTab("drivers");
   };
 
   const handleViewTripDetails = (
     tripId: string,
   ): void => {
-    if (
-      !canAccessTab(
-        user.role,
-        "trips",
-      )
-    ) {
+    if (!canAccessTab(user.role, "trips")) {
       return;
     }
 
     setSelectedTripId(tripId);
+    setSelectedVehicleId(null);
+    setSelectedDriverId(null);
     setCurrentTab("trips");
   };
 
-  const renderTabContent =
-    (): React.ReactNode => {
-      if (
-        !canAccessTab(
-          user.role,
-          currentTab,
-        )
-      ) {
+  const renderTabContent = (): React.ReactNode => {
+    if (!canAccessTab(user.role, currentTab)) {
+      return (
+        <AccessDenied
+          onReturnToDashboard={() =>
+            handleTabChange(DEFAULT_TAB)
+          }
+        />
+      );
+    }
+
+    if (currentTab === "vehicles") {
+      if (selectedVehicleId) {
         return (
-          <AccessDenied
-            onReturnToDashboard={() =>
-              handleTabChange(
-                DEFAULT_TAB,
-              )
-            }
+          <VehicleDetailsPage
+            vehicleId={selectedVehicleId}
+            onBack={() => setSelectedVehicleId(null)}
           />
         );
       }
 
-      if (currentTab === "vehicles") {
-        if (selectedVehicleId) {
-          return (
-            <VehicleDetailsPage
-              vehicleId={selectedVehicleId}
-              onBack={() =>
-                setSelectedVehicleId(null)
-              }
-            />
-          );
-        }
+      return (
+        <VehiclesPage
+          onViewDetails={handleViewVehicleDetails}
+        />
+      );
+    }
 
+    if (currentTab === "drivers") {
+      if (selectedDriverId) {
         return (
-          <VehiclesPage
-            onViewDetails={
-              handleViewVehicleDetails
-            }
+          <DriverDetailsPage
+            driverId={selectedDriverId}
+            onBack={() => setSelectedDriverId(null)}
           />
         );
       }
 
-      if (currentTab === "trips") {
-        if (selectedTripId) {
-          return (
-            <TripDetailsPage
-              tripId={selectedTripId}
-              onBack={() =>
-                setSelectedTripId(null)
-              }
-            />
-          );
-        }
+      return (
+        <DriversPage
+          onViewDetails={handleViewDriverDetails}
+        />
+      );
+    }
 
+    if (currentTab === "trips") {
+      if (selectedTripId) {
         return (
-          <TripsPage
-            onViewDetails={
-              handleViewTripDetails
-            }
+          <TripDetailsPage
+            tripId={selectedTripId}
+            onBack={() => setSelectedTripId(null)}
           />
         );
       }
 
-      switch (currentTab) {
-        case "dashboard":
-          return <DashboardPage />;
+      return (
+        <TripsPage
+          onViewDetails={handleViewTripDetails}
+        />
+      );
+    }
 
-        case "drivers":
-          return <DriversPage />;
-
-        case "maintenance":
-          return <MaintenancePage />;
-
-        case "fuel-expenses":
-          return <FuelExpensesPage />;
-
-        case "reports":
-          return <ReportsPage />;
-
-        case "users":
-          return <UsersPage />;
-
-        case "notifications":
-          return <NotificationsPage />;
-
-        default:
-          return <DashboardPage />;
-      }
-    };
+    switch (currentTab) {
+      case "dashboard":
+        return <DashboardPage />;
+      case "maintenance":
+        return <MaintenancePage />;
+      case "fuel-expenses":
+        return <FuelExpensesPage />;
+      case "reports":
+        return <ReportsPage />;
+      case "users":
+        return <UsersPage />;
+      case "notifications":
+        return <NotificationsPage />;
+      default:
+        return <DashboardPage />;
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-[#0A0A0A] text-white flex relative overflow-hidden font-sans">
-      <div className="absolute top-0 right-0 w-1/3 h-full bg-[#111111] -z-10 border-l border-white/5 pointer-events-none" />
-
-      <div className="absolute -bottom-24 -left-24 w-96 h-96 bg-blue-600/5 rounded-full blur-[120px] -z-10 pointer-events-none" />
-
-      <div className="absolute top-1/4 left-1/3 w-72 h-72 bg-blue-500/5 rounded-full blur-[100px] -z-10 pointer-events-none" />
+    <div className="relative flex min-h-screen overflow-hidden bg-[#0A0A0A] font-sans text-white">
+      <div className="pointer-events-none absolute right-0 top-0 -z-10 h-full w-1/3 border-l border-white/5 bg-[#111111]" />
+      <div className="pointer-events-none absolute -bottom-24 -left-24 -z-10 h-96 w-96 rounded-full bg-blue-600/5 blur-[120px]" />
+      <div className="pointer-events-none absolute left-1/3 top-1/4 -z-10 h-72 w-72 rounded-full bg-blue-500/5 blur-[100px]" />
 
       <Sidebar
         currentTab={currentTab}
         onTabChange={handleTabChange}
         onLogout={logout}
-        notificationsCount={
-          notificationsCount
-        }
+        notificationsCount={notificationsCount}
       />
 
-      <div className="flex-1 pl-64 flex flex-col min-h-screen z-10">
-        <header className="h-16 border-b border-white/5 bg-[#0A0A0A]/80 backdrop-blur-md px-8 flex items-center justify-between sticky top-0 z-20">
-          <span className="text-[10px] text-white/40 font-mono tracking-[0.2em] uppercase font-semibold">
-            {new Date().toLocaleDateString(
-              [],
-              {
-                weekday: "long",
-                year: "numeric",
-                month: "long",
-                day: "numeric",
-              },
-            )}
+      <div className="z-10 flex min-h-screen flex-1 flex-col pl-64">
+        <header className="sticky top-0 z-20 flex h-16 items-center justify-between border-b border-white/5 bg-[#0A0A0A]/80 px-8 backdrop-blur-md">
+          <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-white/40">
+            {new Date().toLocaleDateString([], {
+              weekday: "long",
+              year: "numeric",
+              month: "long",
+              day: "numeric",
+            })}
           </span>
 
-          <div className="flex items-center gap-4 text-[10px] uppercase tracking-wider font-semibold text-white/50">
+          <div className="flex items-center gap-4 text-[10px] font-semibold uppercase tracking-wider text-white/50">
             <span>
               Terminal:{" "}
-              <span className="font-mono text-blue-400 font-bold">
+              <span className="font-mono font-bold text-blue-400">
                 Main Server
               </span>
             </span>
-
-            <span className="text-white/10">
-              |
-            </span>
-
+            <span className="text-white/10">|</span>
             <span>
               Auth Session:{" "}
-              <span className="font-mono text-blue-400 font-bold">
+              <span className="font-mono font-bold text-blue-400">
                 {user.email}
               </span>
             </span>
           </div>
         </header>
 
-        <main className="p-8 flex-1 max-w-7xl w-full mx-auto pb-16">
+        <main className="mx-auto w-full max-w-7xl flex-1 p-8 pb-16">
           {renderTabContent()}
         </main>
       </div>
@@ -398,3 +362,5 @@ export default function App() {
     </AuthProvider>
   );
 }
+
+

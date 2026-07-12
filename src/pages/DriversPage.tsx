@@ -3,486 +3,730 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from "react";
-import { apiFetch } from "../utils/api.js";
-import { useAuth } from "../context/AuthContext.js";
-import { DriverStatus, UserRole } from "../types.js";
-import { Search, UserPlus, AlertTriangle, ShieldCheck, Ban, Check, Shield } from "lucide-react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import {
+  AlertTriangle,
+  Ban,
+  Check,
+  Eye,
+  Pencil,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  Trash2,
+  UserPlus,
+} from "lucide-react";
 
-export const DriversPage: React.FC = () => {
+import { DriverFormModal } from "../components/DriverFormModal.js";
+import { useAuth } from "../context/AuthContext.js";
+import {
+  type Driver,
+  DriverStatus,
+  UserRole,
+} from "../types.js";
+import { apiFetch } from "../utils/api.js";
+
+interface DriversPageProps {
+  onViewDetails: (driverId: string) => void;
+}
+
+interface DriverListResponse {
+  data: Driver[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+type DriverSortField =
+  | "created_at"
+  | "full_name"
+  | "licence_number"
+  | "licence_expiry_date"
+  | "safety_score"
+  | "region"
+  | "status";
+
+type SortOrder = "asc" | "desc";
+type LicenceFilter = "" | "VALID" | "EXPIRING_SOON" | "EXPIRED";
+
+const PAGE_SIZE = 10;
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "Failed to load driver records.";
+}
+
+function todayDate(): string {
+  return new Date().toISOString().split("T")[0];
+}
+
+function licenceLimitDate(): string {
+  const limit = new Date();
+  limit.setUTCDate(limit.getUTCDate() + 30);
+  return limit.toISOString().split("T")[0];
+}
+
+function getLicenceState(
+  expiryDate: string,
+): "VALID" | "EXPIRING_SOON" | "EXPIRED" {
+  if (expiryDate < todayDate()) {
+    return "EXPIRED";
+  }
+
+  if (expiryDate <= licenceLimitDate()) {
+    return "EXPIRING_SOON";
+  }
+
+  return "VALID";
+}
+
+function LicenceBadge({ expiryDate }: { expiryDate: string }) {
+  const state = getLicenceState(expiryDate);
+
+  const styles = {
+    VALID:
+      "border-emerald-900/50 bg-emerald-950/50 text-emerald-400",
+    EXPIRING_SOON:
+      "border-amber-900/50 bg-amber-950/40 text-amber-400",
+    EXPIRED:
+      "border-red-900/50 bg-red-950/50 text-red-400",
+  } as const;
+
+  return (
+    <span
+      className={`inline-flex rounded border px-2 py-0.5 text-[10px] font-bold ${styles[state]}`}
+    >
+      {state.replaceAll("_", " ")}
+    </span>
+  );
+}
+
+function StatusBadge({ status }: { status: DriverStatus }) {
+  const styles: Record<DriverStatus, string> = {
+    [DriverStatus.AVAILABLE]:
+      "border-emerald-900/50 bg-emerald-950 text-emerald-400",
+    [DriverStatus.ON_TRIP]:
+      "border-blue-900/50 bg-blue-950 text-blue-400",
+    [DriverStatus.OFF_DUTY]:
+      "border-amber-900/50 bg-amber-950/30 text-amber-400",
+    [DriverStatus.SUSPENDED]:
+      "border-red-900/50 bg-red-950 text-red-400",
+  };
+
+  return (
+    <span
+      className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${styles[status]}`}
+    >
+      {status.replaceAll("_", " ")}
+    </span>
+  );
+}
+
+export const DriversPage: React.FC<DriversPageProps> = ({
+  onViewDetails,
+}) => {
   const { user } = useAuth();
-  const [drivers, setDrivers] = useState<any[]>([]);
+  const [drivers, setDrivers] = useState<Driver[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [successMsg, setSuccessMsg] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
 
-  // Filters
+  const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
-  const [licenceFilter, setLicenceFilter] = useState("");
+  const [licenceFilter, setLicenceFilter] =
+    useState<LicenceFilter>("");
   const [regionFilter, setRegionFilter] = useState("");
+  const [sortBy, setSortBy] =
+    useState<DriverSortField>("created_at");
+  const [sortOrder, setSortOrder] =
+    useState<SortOrder>("desc");
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
 
-  // Add Form states
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [formLoading, setFormLoading] = useState(false);
-  const [formError, setFormError] = useState("");
-  const [form, setForm] = useState({
-    full_name: "",
-    licence_number: "",
-    licence_category: "Heavy Commercial",
-    licence_expiry_date: "",
-    contact_number: "",
-    safety_score: "100",
-    region: "Patna",
-    status: DriverStatus.AVAILABLE,
-  });
+  const [formMode, setFormMode] = useState<
+    "create" | "edit" | null
+  >(null);
+  const [selectedDriver, setSelectedDriver] =
+    useState<Driver | null>(null);
 
-  const fetchDrivers = async () => {
+  const canManageProfiles = Boolean(
+    user &&
+      [
+        UserRole.ADMIN,
+        UserRole.DISPATCHER,
+        UserRole.SAFETY_OFFICER,
+      ].includes(user.role),
+  );
+  const canSanction = Boolean(
+    user &&
+      [UserRole.ADMIN, UserRole.SAFETY_OFFICER].includes(
+        user.role,
+      ),
+  );
+  const canDelete = user?.role === UserRole.ADMIN;
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setSearch(searchInput.trim());
+      setPage(1);
+    }, 300);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [searchInput]);
+
+  const queryString = useMemo(() => {
+    const query = new URLSearchParams({
+      page: String(page),
+      page_size: String(PAGE_SIZE),
+      sort_by: sortBy,
+      sort_order: sortOrder,
+    });
+
+    if (search) query.set("search", search);
+    if (statusFilter) query.set("status", statusFilter);
+    if (licenceFilter) {
+      query.set("licence_status", licenceFilter);
+    }
+    if (regionFilter.trim()) {
+      query.set("region", regionFilter.trim());
+    }
+
+    return query.toString();
+  }, [
+    licenceFilter,
+    page,
+    regionFilter,
+    search,
+    sortBy,
+    sortOrder,
+    statusFilter,
+  ]);
+
+  const fetchDrivers = useCallback(async (): Promise<void> => {
+    setLoading(true);
+    setError("");
+
     try {
-      setLoading(true);
-      const query = new URLSearchParams({
-        search,
-        status: statusFilter,
-        licence_status: licenceFilter,
-        region: regionFilter,
-      });
-      const data = await apiFetch(`/drivers?${query.toString()}`);
-      setDrivers(data);
-    } catch (err: any) {
-      setError(err.message || "Failed to load drivers.");
+      const response = await apiFetch<DriverListResponse>(
+        `/drivers?${queryString}`,
+      );
+      setDrivers(response.data);
+      setTotal(response.total);
+      setTotalPages(response.total_pages);
+
+      if (response.page !== page) {
+        setPage(response.page);
+      }
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
+      setDrivers([]);
+      setTotal(0);
+      setTotalPages(1);
     } finally {
       setLoading(false);
     }
-  };
+  }, [page, queryString]);
 
   useEffect(() => {
-    fetchDrivers();
-  }, [search, statusFilter, licenceFilter, regionFilter]);
+    void fetchDrivers();
+  }, [fetchDrivers]);
 
-  const handleAddDriver = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setFormLoading(true);
-    setFormError("");
+  const showSuccess = (message: string): void => {
+    setSuccessMessage(message);
+    window.setTimeout(() => setSuccessMessage(""), 4000);
+  };
+
+  const openCreateForm = (): void => {
+    setSelectedDriver(null);
+    setFormMode("create");
+  };
+
+  const openEditForm = (driver: Driver): void => {
+    setSelectedDriver(driver);
+    setFormMode("edit");
+  };
+
+  const closeForm = (): void => {
+    setFormMode(null);
+    setSelectedDriver(null);
+  };
+
+  const handleSaved = (message: string): void => {
+    closeForm();
+    showSuccess(message);
+    void fetchDrivers();
+  };
+
+  const handleSuspend = async (driver: Driver): Promise<void> => {
+    const confirmed = window.confirm(
+      `Suspend ${driver.full_name}? Suspended drivers cannot be dispatched.`,
+    );
+    if (!confirmed) return;
 
     try {
-      await apiFetch("/drivers", {
-        method: "POST",
-        body: JSON.stringify({
-          ...form,
-          safety_score: Number(form.safety_score),
-        }),
+      await apiFetch(`/drivers/${driver.id}/suspend`, {
+        method: "PATCH",
       });
+      showSuccess("Driver suspended successfully.");
+      await fetchDrivers();
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
+    }
+  };
 
-      setSuccessMsg("Driver profile registered successfully.");
-      setShowAddModal(false);
-      setForm({
-        full_name: "",
-        licence_number: "",
-        licence_category: "Heavy Commercial",
-        licence_expiry_date: "",
-        contact_number: "",
-        safety_score: "100",
-        region: "Patna",
-        status: DriverStatus.AVAILABLE,
+  const handleActivate = async (driver: Driver): Promise<void> => {
+    try {
+      await apiFetch(`/drivers/${driver.id}/activate`, {
+        method: "PATCH",
       });
-      fetchDrivers();
-      setTimeout(() => setSuccessMsg(""), 4000);
-    } catch (err: any) {
-      setFormError(err.message || "Failed to create driver.");
-    } finally {
-      setFormLoading(false);
+      showSuccess("Driver restored to Available.");
+      await fetchDrivers();
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
     }
   };
 
-  const handleSuspend = async (driverId: string) => {
-    if (!confirm("Are you sure you want to SUSPEND this driver? Suspended drivers cannot be assigned on active trips.")) return;
+  const handleDelete = async (driver: Driver): Promise<void> => {
+    const confirmed = window.confirm(
+      `Permanently delete ${driver.full_name}? Drivers with trip history cannot be deleted.`,
+    );
+    if (!confirmed) return;
+
     try {
-      await apiFetch(`/drivers/${driverId}/suspend`, { method: "PATCH" });
-      setSuccessMsg("Driver status updated to SUSPENDED.");
-      fetchDrivers();
-      setTimeout(() => setSuccessMsg(""), 4000);
-    } catch (err: any) {
-      alert(err.message);
+      await apiFetch(`/drivers/${driver.id}`, {
+        method: "DELETE",
+      });
+      showSuccess("Driver profile deleted successfully.");
+      await fetchDrivers();
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
     }
   };
 
-  const handleActivate = async (driverId: string) => {
-    try {
-      await apiFetch(`/drivers/${driverId}/activate`, { method: "PATCH" });
-      setSuccessMsg("Driver status restored to AVAILABLE.");
-      fetchDrivers();
-      setTimeout(() => setSuccessMsg(""), 4000);
-    } catch (err: any) {
-      alert(err.message);
+  const toggleSort = (field: DriverSortField): void => {
+    setPage(1);
+
+    if (sortBy === field) {
+      setSortOrder((current) =>
+        current === "asc" ? "desc" : "asc",
+      );
+      return;
     }
+
+    setSortBy(field);
+    setSortOrder(field === "safety_score" ? "desc" : "asc");
   };
 
-  // Helper: get licence validity styling
-  const getLicenceBadge = (expiryStr: string) => {
-    const today = new Date();
-    const expiry = new Date(expiryStr);
-    const limit30 = new Date(Date.now() + 30 * 86400000);
-
-    const todayStr = today.toISOString().split("T")[0];
-    const limitStr = limit30.toISOString().split("T")[0];
-
-    if (expiryStr < todayStr) {
-      return (
-        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-red-950 text-red-400 border border-red-900 uppercase">
-          EXPIRED
-        </span>
-      );
-    } else if (expiryStr <= limitStr) {
-      return (
-        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-amber-955 text-amber-400 border border-amber-900 uppercase">
-          EXPIRING SOON
-        </span>
-      );
-    } else {
-      return (
-        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-900/40 uppercase">
-          VALID
-        </span>
-      );
-    }
+  const clearFilters = (): void => {
+    setSearchInput("");
+    setSearch("");
+    setStatusFilter("");
+    setLicenceFilter("");
+    setRegionFilter("");
+    setSortBy("created_at");
+    setSortOrder("desc");
+    setPage(1);
   };
 
-  const isSafetyOfficerOrAdmin = user && [UserRole.ADMIN, UserRole.SAFETY_OFFICER, UserRole.DISPATCHER].includes(user.role);
+  const hasFilters = Boolean(
+    searchInput ||
+      statusFilter ||
+      licenceFilter ||
+      regionFilter,
+  );
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h2 className="text-2xl font-bold text-slate-100">Drivers Roster</h2>
-          <p className="text-sm text-slate-400">Driver licence records, compliance tracking, and safety scores</p>
+          <h2 className="text-2xl font-bold text-slate-100">
+            Drivers Roster
+          </h2>
+          <p className="text-sm text-slate-400">
+            Licence compliance, safety scores, availability, and trip history
+          </p>
         </div>
-        {isSafetyOfficerOrAdmin && (
+
+        {canManageProfiles && (
           <button
-            onClick={() => setShowAddModal(true)}
-            className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2.5 rounded-lg text-sm flex items-center gap-2 cursor-pointer transition-colors"
+            type="button"
+            onClick={openCreateForm}
+            className="flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-bold text-slate-950 transition-colors hover:bg-emerald-400"
           >
-            <UserPlus size={16} className="stroke-[2.5]" />
-            <span>Add Driver Profile</span>
+            <UserPlus size={16} />
+            Add Driver Profile
           </button>
         )}
       </div>
 
-      {successMsg && (
-        <div className="bg-emerald-950/40 border border-emerald-900 text-emerald-200 px-4 py-3 rounded-lg text-sm font-semibold">
-          {successMsg}
+      {successMessage && (
+        <div className="rounded-lg border border-emerald-900 bg-emerald-950/40 px-4 py-3 text-sm font-semibold text-emerald-200">
+          {successMessage}
         </div>
       )}
 
-      {/* Query Filters */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
-        {/* Search */}
-        <div className="space-y-1.5 col-span-1 md:col-span-2">
-          <label className="text-xs font-semibold text-slate-400 uppercase">Search drivers</label>
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600" size={16} />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search by full name, licence, contact..."
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-4 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
-            />
-          </div>
+      {error && (
+        <div className="flex flex-col gap-3 rounded-lg border border-red-900 bg-red-950/30 px-4 py-3 text-sm text-red-200 sm:flex-row sm:items-center sm:justify-between">
+          <span>{error}</span>
+          <button
+            type="button"
+            onClick={() => void fetchDrivers()}
+            className="inline-flex items-center gap-1.5 text-xs font-bold text-red-100 hover:text-white"
+          >
+            <RefreshCw size={13} /> Retry
+          </button>
         </div>
+      )}
 
-        {/* Status filter */}
-        <div className="space-y-1.5">
-          <label className="text-xs font-semibold text-slate-400 uppercase">Driver Status</label>
+      <div className="grid grid-cols-1 gap-4 rounded-xl border border-slate-800 bg-slate-900 p-5 md:grid-cols-2 xl:grid-cols-5">
+        <label className="space-y-1.5 md:col-span-2">
+          <span className="text-xs font-semibold uppercase text-slate-400">
+            Search Drivers
+          </span>
+          <span className="relative block">
+            <Search
+              className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600"
+              size={16}
+            />
+            <input
+              type="search"
+              value={searchInput}
+              onChange={(event) =>
+                setSearchInput(event.target.value)
+              }
+              placeholder="Name, licence number, or contact..."
+              className="w-full rounded-lg border border-slate-800 bg-slate-950 py-2.5 pl-9 pr-3 text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-emerald-500"
+            />
+          </span>
+        </label>
+
+        <label className="space-y-1.5">
+          <span className="text-xs font-semibold uppercase text-slate-400">
+            Driver Status
+          </span>
           <select
             value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-emerald-500"
+            onChange={(event) => {
+              setStatusFilter(event.target.value);
+              setPage(1);
+            }}
+            className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-emerald-500"
           >
             <option value="">All Statuses</option>
-            {Object.values(DriverStatus).map((st) => (
-              <option key={st} value={st}>
-                {st.replace("_", " ")}
+            {Object.values(DriverStatus).map((status) => (
+              <option key={status} value={status}>
+                {status.replaceAll("_", " ")}
               </option>
             ))}
           </select>
-        </div>
+        </label>
 
-        {/* Licence status */}
-        <div className="space-y-1.5">
-          <label className="text-xs font-semibold text-slate-400 uppercase">Licence status</label>
+        <label className="space-y-1.5">
+          <span className="text-xs font-semibold uppercase text-slate-400">
+            Licence Status
+          </span>
           <select
             value={licenceFilter}
-            onChange={(e) => setLicenceFilter(e.target.value)}
-            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-emerald-500"
+            onChange={(event) => {
+              setLicenceFilter(
+                event.target.value as LicenceFilter,
+              );
+              setPage(1);
+            }}
+            className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-emerald-500"
           >
             <option value="">All Licences</option>
-            <option value="VALID">Valid Only</option>
+            <option value="VALID">Valid</option>
             <option value="EXPIRING_SOON">Expiring Soon</option>
             <option value="EXPIRED">Expired</option>
           </select>
+        </label>
+
+        <label className="space-y-1.5">
+          <span className="text-xs font-semibold uppercase text-slate-400">
+            Region
+          </span>
+          <input
+            type="text"
+            value={regionFilter}
+            onChange={(event) => {
+              setRegionFilter(event.target.value);
+              setPage(1);
+            }}
+            placeholder="e.g. Patna"
+            className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-emerald-500"
+          />
+        </label>
+      </div>
+
+      <div className="flex flex-col gap-3 rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-3 text-xs sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-wrap items-center gap-3 text-slate-400">
+          <span>Sort:</span>
+          {(
+            [
+              ["full_name", "Name"],
+              ["licence_expiry_date", "Licence Expiry"],
+              ["safety_score", "Safety Score"],
+            ] as const
+          ).map(([field, label]) => (
+            <button
+              key={field}
+              type="button"
+              onClick={() => toggleSort(field)}
+              className={`font-medium hover:text-emerald-400 ${
+                sortBy === field
+                  ? "font-bold text-emerald-400"
+                  : ""
+              }`}
+            >
+              {label}{" "}
+              {sortBy === field &&
+                (sortOrder === "asc" ? "▲" : "▼")}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-3">
+          <span className="font-mono text-slate-500">
+            Total: <strong className="text-slate-300">{total}</strong>
+          </span>
+          <button
+            type="button"
+            onClick={() => void fetchDrivers()}
+            className="inline-flex items-center gap-1.5 text-slate-400 hover:text-white"
+          >
+            <RefreshCw size={13} /> Refresh
+          </button>
+          {hasFilters && (
+            <button
+              type="button"
+              onClick={clearFilters}
+              className="text-slate-400 hover:text-white"
+            >
+              Clear filters
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Listing */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+      <div className="overflow-hidden rounded-xl border border-slate-800 bg-slate-900">
         {loading ? (
-          <div className="p-12 text-center text-slate-400 font-mono text-sm uppercase">
-            Loading roster telemetries...
+          <div className="p-12 text-center font-mono text-sm uppercase tracking-wider text-slate-400">
+            Loading driver records...
           </div>
         ) : drivers.length === 0 ? (
           <div className="p-16 text-center text-slate-500">
-            <AlertTriangle className="mx-auto text-slate-600 mb-3" size={36} />
-            <p className="font-bold text-slate-400">No Drivers Found</p>
-            <p className="text-xs text-slate-500 mt-1">Adjust filters or create a new operator profile.</p>
+            <AlertTriangle
+              className="mx-auto mb-3 text-slate-600"
+              size={36}
+            />
+            <p className="font-bold text-slate-400">
+              No Drivers Found
+            </p>
+            <p className="mt-1 text-xs">
+              Adjust the filters or register a new profile.
+            </p>
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm text-slate-300">
-              <thead className="bg-slate-950 text-slate-400 text-xs uppercase tracking-wider border-b border-slate-800">
+            <table className="w-full min-w-[1050px] text-left text-sm text-slate-300">
+              <thead className="border-b border-slate-800 bg-slate-950 text-xs uppercase tracking-wider text-slate-400">
                 <tr>
-                  <th className="px-6 py-4">Full Name</th>
-                  <th className="px-6 py-4">Licence Info</th>
-                  <th className="px-6 py-4">Region & Contact</th>
-                  <th className="px-6 py-4">Safety Score</th>
-                  <th className="px-6 py-4">Status</th>
-                  {user && [UserRole.ADMIN, UserRole.SAFETY_OFFICER].includes(user.role) && (
-                    <th className="px-6 py-4 text-right">Sanctions</th>
-                  )}
+                  <th className="px-5 py-4">Driver</th>
+                  <th className="px-5 py-4">Licence</th>
+                  <th className="px-5 py-4">Region & Contact</th>
+                  <th className="px-5 py-4">Safety</th>
+                  <th className="px-5 py-4">Status</th>
+                  <th className="px-5 py-4 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
-                {drivers.map((d) => (
-                  <tr key={d.id} className="hover:bg-slate-800/40 transition-colors">
-                    <td className="px-6 py-4 font-semibold text-slate-100">
-                      {d.full_name}
-                    </td>
-                    <td className="px-6 py-4 space-y-1">
-                      <div className="font-mono text-xs text-slate-200">{d.licence_number}</div>
-                      <div className="text-xs text-slate-500">{d.licence_category}</div>
-                      <div className="flex items-center gap-2 mt-1">
-                        <span className="text-[10px] text-slate-500">Exp: {d.licence_expiry_date}</span>
-                        {getLicenceBadge(d.licence_expiry_date)}
+                {drivers.map((driver) => (
+                  <tr
+                    key={driver.id}
+                    className="transition-colors hover:bg-slate-800/35"
+                  >
+                    <td className="px-5 py-4">
+                      <div className="font-semibold text-slate-100">
+                        {driver.full_name}
+                      </div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        {driver.licence_category}
                       </div>
                     </td>
-                    <td className="px-6 py-4">
-                      <div className="text-slate-300">{d.region}</div>
-                      <div className="text-xs text-slate-500 font-mono">{d.contact_number}</div>
-                    </td>
-                    <td className="px-6 py-4">
-                      <div className="flex items-center gap-2.5">
-                        <span className={`text-sm font-bold font-mono ${
-                          d.safety_score >= 90 ? "text-emerald-400" :
-                          d.safety_score >= 75 ? "text-amber-400" : "text-rose-500"
-                        }`}>
-                          {d.safety_score}/100
+                    <td className="px-5 py-4">
+                      <div className="font-mono text-xs text-slate-200">
+                        {driver.licence_number}
+                      </div>
+                      <div className="mt-1.5 flex items-center gap-2">
+                        <span className="text-[10px] text-slate-500">
+                          Exp: {driver.licence_expiry_date}
                         </span>
-                        {/* Tiny score visual bar */}
-                        <div className="w-16 bg-slate-800 h-1.5 rounded-full overflow-hidden hidden sm:block">
+                        <LicenceBadge
+                          expiryDate={driver.licence_expiry_date}
+                        />
+                      </div>
+                    </td>
+                    <td className="px-5 py-4">
+                      <div>{driver.region}</div>
+                      <div className="mt-1 font-mono text-xs text-slate-500">
+                        {driver.contact_number}
+                      </div>
+                    </td>
+                    <td className="px-5 py-4">
+                      <div className="flex items-center gap-2.5">
+                        <span
+                          className={`font-mono text-sm font-bold ${
+                            driver.safety_score >= 90
+                              ? "text-emerald-400"
+                              : driver.safety_score >= 75
+                                ? "text-amber-400"
+                                : "text-red-400"
+                          }`}
+                        >
+                          {driver.safety_score}/100
+                        </span>
+                        <div className="hidden h-1.5 w-16 overflow-hidden rounded-full bg-slate-800 sm:block">
                           <div
-                            className={`h-full rounded-full ${
-                              d.safety_score >= 90 ? "bg-emerald-500" :
-                              d.safety_score >= 75 ? "bg-amber-500" : "bg-rose-500"
+                            className={`h-full ${
+                              driver.safety_score >= 90
+                                ? "bg-emerald-500"
+                                : driver.safety_score >= 75
+                                  ? "bg-amber-500"
+                                  : "bg-red-500"
                             }`}
-                            style={{ width: `${d.safety_score}%` }}
-                          ></div>
+                            style={{
+                              width: `${driver.safety_score}%`,
+                            }}
+                          />
                         </div>
                       </div>
                     </td>
-                    <td className="px-6 py-4">
-                      {d.status === DriverStatus.AVAILABLE && (
-                        <span className="inline-flex px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-900/50">
-                          Available
-                        </span>
-                      )}
-                      {d.status === DriverStatus.ON_TRIP && (
-                        <span className="inline-flex px-2.5 py-1 rounded-full text-xs font-semibold bg-blue-950 text-blue-400 border border-blue-900/50">
-                          On Trip
-                        </span>
-                      )}
-                      {d.status === DriverStatus.OFF_DUTY && (
-                        <span className="inline-flex px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-950/20 text-amber-500 border border-amber-900/50">
-                          Off Duty
-                        </span>
-                      )}
-                      {d.status === DriverStatus.SUSPENDED && (
-                        <span className="inline-flex px-2.5 py-1 rounded-full text-xs font-semibold bg-red-950 text-red-400 border border-red-900/50">
-                          Suspended
-                        </span>
-                      )}
+                    <td className="px-5 py-4">
+                      <StatusBadge status={driver.status} />
                     </td>
-                    {user && [UserRole.ADMIN, UserRole.SAFETY_OFFICER].includes(user.role) && (
-                      <td className="px-6 py-4 text-right">
-                        {d.status === DriverStatus.SUSPENDED ? (
+                    <td className="px-5 py-4">
+                      <div className="flex flex-wrap justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => onViewDetails(driver.id)}
+                          className="inline-flex items-center gap-1 rounded border border-slate-700 px-2.5 py-1.5 text-xs text-slate-300 hover:border-slate-500 hover:text-white"
+                        >
+                          <Eye size={13} /> View
+                        </button>
+
+                        {canManageProfiles &&
+                          driver.status !== DriverStatus.ON_TRIP && (
+                            <button
+                              type="button"
+                              onClick={() => openEditForm(driver)}
+                              className="inline-flex items-center gap-1 rounded border border-blue-900/70 bg-blue-950/30 px-2.5 py-1.5 text-xs text-blue-300 hover:bg-blue-950/60"
+                            >
+                              <Pencil size={13} /> Edit
+                            </button>
+                          )}
+
+                        {canSanction &&
+                          (driver.status ===
+                          DriverStatus.SUSPENDED ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void handleActivate(driver)
+                              }
+                              className="inline-flex items-center gap-1 rounded border border-emerald-800 bg-emerald-950 px-2.5 py-1.5 text-xs font-bold text-emerald-400 hover:bg-emerald-900"
+                            >
+                              <Check size={13} /> Activate
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void handleSuspend(driver)
+                              }
+                              disabled={
+                                driver.status === DriverStatus.ON_TRIP
+                              }
+                              className="inline-flex items-center gap-1 rounded border border-red-900/70 bg-red-950/40 px-2.5 py-1.5 text-xs font-bold text-red-400 hover:bg-red-900 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              <Ban size={13} /> Suspend
+                            </button>
+                          ))}
+
+                        {canDelete && (
                           <button
-                            onClick={() => handleActivate(d.id)}
-                            className="bg-emerald-950 hover:bg-emerald-900 border border-emerald-800 text-emerald-400 font-bold px-3 py-1.5 rounded text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+                            type="button"
+                            onClick={() => void handleDelete(driver)}
+                            disabled={
+                              driver.status === DriverStatus.ON_TRIP
+                            }
+                            className="inline-flex items-center gap-1 rounded border border-red-950 px-2.5 py-1.5 text-xs text-red-400 hover:border-red-800 hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-40"
                           >
-                            <Check size={12} /> Un-Suspend
-                          </button>
-                        ) : (
-                          <button
-                            onClick={() => handleSuspend(d.id)}
-                            className="bg-red-950/50 hover:bg-red-900 border border-red-900/60 text-red-400 font-bold px-3 py-1.5 rounded text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
-                            disabled={d.status === DriverStatus.ON_TRIP}
-                            title={d.status === DriverStatus.ON_TRIP ? "Driver is currently on active trip" : "Suspend driver"}
-                          >
-                            <Ban size={12} /> Suspend
+                            <Trash2 size={13} /> Delete
                           </button>
                         )}
-                      </td>
-                    )}
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )}
+
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between border-t border-slate-800 bg-slate-950 px-6 py-4 text-xs">
+            <button
+              type="button"
+              onClick={() =>
+                setPage((current) => Math.max(1, current - 1))
+              }
+              disabled={page <= 1}
+              className="rounded border border-slate-800 bg-slate-900 px-3 py-1.5 text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Previous
+            </button>
+            <span className="font-mono text-slate-400">
+              Page {page} of {totalPages}
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                setPage((current) =>
+                  Math.min(totalPages, current + 1),
+                )
+              }
+              disabled={page >= totalPages}
+              className="rounded border border-slate-800 bg-slate-900 px-3 py-1.5 text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Next
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Add Driver Modal */}
-      {showAddModal && (
-        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-lg w-full p-6 shadow-2xl">
-            <div className="flex justify-between items-center border-b border-slate-800 pb-3.5 mb-5">
-              <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                <Shield size={18} className="text-emerald-400" /> Create Driver License Record
-              </h3>
-              <button
-                onClick={() => setShowAddModal(false)}
-                className="text-slate-500 hover:text-slate-300 text-lg font-bold bg-transparent border-none cursor-pointer"
-              >
-                ✕
-              </button>
-            </div>
+      <div className="flex items-center gap-2 text-[11px] text-slate-500">
+        <ShieldCheck size={13} />
+        Dispatch validation rejects expired, Suspended, Off Duty, and On Trip drivers.
+      </div>
 
-            {formError && (
-              <div className="mb-4 bg-red-950/40 border border-red-900 text-red-200 p-3 rounded text-xs font-semibold">
-                {formError}
-              </div>
-            )}
-
-            <form onSubmit={handleAddDriver} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Driver Full Name
-                </label>
-                <input
-                  type="text"
-                  value={form.full_name}
-                  onChange={(e) => setForm({ ...form, full_name: e.target.value })}
-                  placeholder="Manoj Verma"
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-700"
-                  required
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Licence Number
-                  </label>
-                  <input
-                    type="text"
-                    value={form.licence_number}
-                    onChange={(e) => setForm({ ...form, licence_number: e.target.value })}
-                    placeholder="DL-44444"
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-700 uppercase"
-                    required
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Licence Category
-                  </label>
-                  <input
-                    type="text"
-                    value={form.licence_category}
-                    onChange={(e) => setForm({ ...form, licence_category: e.target.value })}
-                    placeholder="Heavy Commercial"
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Licence Expiry Date
-                  </label>
-                  <input
-                    type="date"
-                    value={form.licence_expiry_date}
-                    onChange={(e) => setForm({ ...form, licence_expiry_date: e.target.value })}
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                    required
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Safety Score (0 - 100)
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    max="100"
-                    value={form.safety_score}
-                    onChange={(e) => setForm({ ...form, safety_score: e.target.value })}
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Contact Number
-                  </label>
-                  <input
-                    type="text"
-                    value={form.contact_number}
-                    onChange={(e) => setForm({ ...form, contact_number: e.target.value })}
-                    placeholder="9876543213"
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-700"
-                    required
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Region
-                  </label>
-                  <input
-                    type="text"
-                    value={form.region}
-                    onChange={(e) => setForm({ ...form, region: e.target.value })}
-                    placeholder="Patna"
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="pt-4 flex justify-end gap-3">
-                <button
-                  type="button"
-                  onClick={() => setShowAddModal(false)}
-                  className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-white bg-transparent border border-slate-800 rounded-lg cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={formLoading}
-                  className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-lg text-xs cursor-pointer transition-colors"
-                >
-                  {formLoading ? "Creating Profile..." : "Register Driver"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+      {formMode && user && (
+        <DriverFormModal
+          mode={formMode}
+          driver={selectedDriver}
+          currentUserRole={user.role}
+          onClose={closeForm}
+          onSaved={handleSaved}
+        />
       )}
     </div>
   );
