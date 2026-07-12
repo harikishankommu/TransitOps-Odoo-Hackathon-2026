@@ -2,6 +2,7 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
+export const DATABASE_SCHEMA_VERSION = 1;
 
 export enum UserRole {
   ADMIN = "ADMIN",
@@ -89,140 +90,147 @@ export enum NotificationType {
   SYSTEM = "SYSTEM"
 }
 
-export interface User {
+export interface BaseEntity {
   id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreatedEntity {
+  id: string;
+  created_at: string;
+}
+
+export interface User extends BaseEntity {
   full_name: string;
   email: string;
   password_hash: string;
   role: UserRole;
   is_active: boolean;
-  created_at: string;
-  updated_at: string;
 }
 
-export interface Vehicle {
-  id: string;
+export interface Vehicle extends BaseEntity {
   registration_number: string;
   vehicle_name: string;
   model: string;
   vehicle_type: VehicleType;
-  maximum_load_capacity: number; // in kg
+  maximum_load_capacity: number;
   odometer: number;
   acquisition_cost: number;
   region: string;
   manufacture_year: number;
   fuel_type: FuelType;
   status: VehicleStatus;
-  created_at: string;
-  updated_at: string;
 }
 
-export interface Driver {
-  id: string;
-  user_id?: string; // Optional, links to a User record
+export interface Driver extends BaseEntity {
+  user_id?: string;
   full_name: string;
   licence_number: string;
   licence_category: string;
-  licence_expiry_date: string; // ISO date string (YYYY-MM-DD)
+  licence_expiry_date: string;
   contact_number: string;
-  safety_score: number; // 0 to 100
+  safety_score: number;
   region: string;
   status: DriverStatus;
-  created_at: string;
-  updated_at: string;
 }
 
-export interface Trip {
-  id: string;
-  trip_code: string; // TRIP-0001, TRIP-0002...
+export interface Trip extends BaseEntity {
+  trip_code: string;
   source: string;
   destination: string;
   vehicle_id: string;
   driver_id: string;
   cargo_description: string;
-  cargo_weight: number; // in kg
-  planned_distance: number; // in km
-  actual_distance?: number; // in km
-  planned_start_time: string; // ISO datetime
-  actual_start_time?: string; // ISO datetime
-  completed_at?: string; // ISO datetime
+  cargo_weight: number;
+  planned_distance: number;
+  actual_distance?: number;
+  planned_start_time: string;
+  actual_start_time?: string;
+  completed_at?: string;
   final_odometer?: number;
-  fuel_consumed?: number; // in litres
+  fuel_consumed?: number;
   revenue: number;
   notes?: string;
   status: TripStatus;
-  created_by: string; // user id
-  created_at: string;
-  updated_at: string;
+  created_by: string;
 }
 
-export interface MaintenanceLog {
-  id: string;
+export interface MaintenanceLog extends BaseEntity {
   vehicle_id: string;
   maintenance_type: MaintenanceType;
   description: string;
   service_provider: string;
-  start_date: string; // YYYY-MM-DD
-  expected_completion_date: string; // YYYY-MM-DD
-  completed_date?: string; // YYYY-MM-DD
+  start_date: string;
+  expected_completion_date: string;
+  completed_date?: string;
   estimated_cost: number;
   actual_cost?: number;
   odometer_at_service: number;
   status: MaintenanceStatus;
-  created_by: string; // user id
-  created_at: string;
-  updated_at: string;
+  created_by: string;
 }
 
-export interface FuelLog {
-  id: string;
+export interface FuelLog extends BaseEntity {
   vehicle_id: string;
-  trip_id?: string; // Optional trip connection
+  trip_id?: string;
   fuel_litres: number;
   fuel_cost: number;
-  price_per_litre: number; // calculated: fuel_cost / fuel_litres
+  price_per_litre: number;
   odometer_reading: number;
-  fuel_date: string; // YYYY-MM-DD
+  fuel_date: string;
   fuel_station: string;
   receipt_number: string;
   notes?: string;
-  created_by: string; // user id
-  created_at: string;
-  updated_at: string;
+  created_by: string;
 }
 
-export interface Expense {
-  id: string;
+export interface Expense extends BaseEntity {
   vehicle_id?: string;
   trip_id?: string;
   expense_type: ExpenseType;
   amount: number;
-  expense_date: string; // YYYY-MM-DD
+  expense_date: string;
   description: string;
   receipt_number: string;
-  created_by: string; // user id
-  created_at: string;
-  updated_at: string;
+  created_by: string;
 }
 
-export interface ActivityLog {
-  id: string;
+export interface ActivityLog extends CreatedEntity {
   user_id: string;
-  user_name: string; // Denormalized for easy rendering
+  user_name: string;
   action: string;
   entity_type: string;
   entity_id: string;
   old_value?: string;
   new_value?: string;
-  created_at: string;
 }
 
-export interface Notification {
-  id: string;
+export interface Notification extends CreatedEntity {
   user_id: string;
   title: string;
   message: string;
   notification_type: NotificationType;
   is_read: boolean;
-  created_at: string;
+}
+
+export type PublicUser = Omit<User, "password_hash">;
+
+export interface AuthenticatedUser {
+  id: string;
+  full_name: string;
+  email: string;
+  role: UserRole;
+  is_active: boolean;
+}
+
+export interface DatabaseValidationIssue {
+  collection: string;
+  record_id?: string;
+  message: string;
+}
+
+export interface DatabaseValidationResult {
+  valid: boolean;
+  issues: DatabaseValidationIssue[];
 }
