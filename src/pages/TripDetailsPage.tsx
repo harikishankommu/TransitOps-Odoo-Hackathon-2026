@@ -3,431 +3,609 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from "react";
-import { apiFetch } from "../utils/api.js";
+import React, { useCallback, useEffect, useState } from "react";
+import {
+  ArrowLeft,
+  Ban,
+  Calendar,
+  CheckCircle,
+  Compass,
+  Edit3,
+  Fuel,
+  Gauge,
+  RefreshCw,
+  ShieldAlert,
+  Trash2,
+  Truck,
+  User,
+} from "lucide-react";
+
+import { CompleteTripModal } from "../components/CompleteTripModal.js";
+import { TripFormModal } from "../components/TripFormModal.js";
 import { useAuth } from "../context/AuthContext.js";
-import { TripStatus, UserRole } from "../types.js";
-import { ArrowLeft, Navigation, Route, Calendar, User, Truck, ShieldAlert, CheckCircle, Ban, Compass } from "lucide-react";
+import {
+  DriverStatus,
+  type Trip,
+  TripStatus,
+  UserRole,
+  VehicleStatus,
+} from "../types.js";
+import { apiFetch } from "../utils/api.js";
 
 interface TripDetailsPageProps {
   tripId: string;
   onBack: () => void;
 }
 
-export const TripDetailsPage: React.FC<TripDetailsPageProps> = ({ tripId, onBack }) => {
+interface TripDetails extends Trip {
+  vehicle_name: string;
+  vehicle_registration: string;
+  vehicle_capacity: number;
+  vehicle_odometer: number;
+  vehicle_status: VehicleStatus;
+  driver_name: string;
+  driver_licence: string;
+  driver_licence_expiry: string;
+  driver_phone: string;
+  driver_score: number;
+  driver_status: DriverStatus;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "The trip operation failed.";
+}
+
+function statusClasses(status: TripStatus): string {
+  switch (status) {
+    case TripStatus.DISPATCHED:
+      return "border-blue-900/50 bg-blue-950/50 text-blue-400";
+    case TripStatus.COMPLETED:
+      return "border-emerald-900/50 bg-emerald-950/50 text-emerald-400";
+    case TripStatus.CANCELLED:
+      return "border-red-900/50 bg-red-950/50 text-red-400";
+    default:
+      return "border-slate-700 bg-slate-950 text-slate-400";
+  }
+}
+
+function formatDateTime(value?: string): string {
+  if (!value) {
+    return "Not recorded";
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString();
+}
+
+export const TripDetailsPage: React.FC<
+  TripDetailsPageProps
+> = ({ tripId, onBack }) => {
   const { user } = useAuth();
-  const [trip, setTrip] = useState<any>(null);
+  const [trip, setTrip] = useState<TripDetails | null>(null);
   const [loading, setLoading] = useState(true);
+  const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState("");
-  const [successMsg, setSuccessMsg] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [showCompleteModal, setShowCompleteModal] =
+    useState(false);
 
-  // Complete Form Modal
-  const [showCompleteModal, setShowCompleteModal] = useState(false);
-  const [completeLoading, setCompleteLoading] = useState(false);
-  const [completeError, setCompleteError] = useState("");
-  const [completeForm, setCompleteForm] = useState({
-    actual_distance: "",
-    fuel_consumed: "",
-    actual_end_time: new Date().toISOString().slice(0, 16),
-    notes: "",
-  });
+  const loadDetails = useCallback(async (): Promise<void> => {
+    setLoading(true);
+    setError("");
 
-  const loadDetails = async () => {
     try {
-      setLoading(true);
-      const data = await apiFetch(`/trips/${tripId}`);
-      setTrip(data);
-      // Pre-fill complete form
-      setCompleteForm({
-        actual_distance: data.planned_distance.toString(),
-        fuel_consumed: "15",
-        actual_end_time: new Date().toISOString().slice(0, 16),
-        notes: "",
-      });
-    } catch (err: any) {
-      setError(err.message || "Failed to load trip details sheet.");
+      const response = await apiFetch<TripDetails>(
+        `/trips/${tripId}`,
+      );
+      setTrip(response);
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
+      setTrip(null);
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    loadDetails();
   }, [tripId]);
 
-  const handleDispatch = async () => {
-    if (!confirm("Confirm dispatch: Are you ready to authorize the driver and vehicle for departure? This locks both assets in ON_TRIP status.")) return;
-    try {
-      setLoading(true);
-      await apiFetch(`/trips/${tripId}/dispatch`, { method: "PATCH" });
-      setSuccessMsg("Trip authorized and dispatched successfully.");
-      await loadDetails();
-      setTimeout(() => setSuccessMsg(""), 4000);
-    } catch (err: any) {
-      setError(err.message || "Dispatch authorization failed.");
-      setLoading(false);
-    }
+  useEffect(() => {
+    void loadDetails();
+  }, [loadDetails]);
+
+  const showSuccess = (message: string): void => {
+    setSuccessMessage(message);
+    window.setTimeout(() => setSuccessMessage(""), 4500);
   };
 
-  const handleCancel = async () => {
-    if (!confirm("Confirm cancellation: Are you sure you want to CANCEL this dispatch plan? This returns all locked assets back to AVAILABLE status.")) return;
-    try {
-      setLoading(true);
-      await apiFetch(`/trips/${tripId}/cancel`, { method: "PATCH" });
-      setSuccessMsg("Dispatch plan cancelled successfully.");
-      await loadDetails();
-      setTimeout(() => setSuccessMsg(""), 4000);
-    } catch (err: any) {
-      setError(err.message || "Trip cancellation failed.");
-      setLoading(false);
+  const runTransition = async (
+    endpoint: "dispatch" | "cancel",
+    confirmation: string,
+    success: string,
+  ): Promise<void> => {
+    if (!window.confirm(confirmation)) {
+      return;
     }
-  };
 
-  const handleCompleteSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setCompleteLoading(true);
-    setCompleteError("");
+    setActionLoading(true);
+    setError("");
 
     try {
-      await apiFetch(`/trips/${tripId}/complete`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          actual_distance: Number(completeForm.actual_distance),
-          fuel_consumed: Number(completeForm.fuel_consumed),
-          actual_end_time: completeForm.actual_end_time,
-          notes: completeForm.notes,
-        }),
+      await apiFetch(`/trips/${tripId}/${endpoint}`, {
+        method: "POST",
       });
-
-      setSuccessMsg("Trip operations closed and logged as COMPLETED.");
-      setShowCompleteModal(false);
+      showSuccess(success);
       await loadDetails();
-      setTimeout(() => setSuccessMsg(""), 4000);
-    } catch (err: any) {
-      setCompleteError(err.message || "Closing trip operations failed.");
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
     } finally {
-      setCompleteLoading(false);
+      setActionLoading(false);
+    }
+  };
+
+  const handleDelete = async (): Promise<void> => {
+    if (
+      !trip ||
+      !window.confirm(
+        `Permanently delete ${trip.trip_code}? This action cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+
+    setActionLoading(true);
+    setError("");
+
+    try {
+      await apiFetch(`/trips/${trip.id}`, {
+        method: "DELETE",
+      });
+      onBack();
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
+      setActionLoading(false);
     }
   };
 
   if (loading) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-[300px] text-slate-400 space-y-4">
-        <div className="w-10 h-10 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
-        <p className="font-mono text-xs uppercase tracking-wider">Syncing Dispatch Console...</p>
+      <div className="flex min-h-[320px] flex-col items-center justify-center gap-4 text-slate-400">
+        <div className="h-10 w-10 animate-spin rounded-full border-4 border-emerald-500 border-t-transparent" />
+        <p className="font-mono text-xs uppercase tracking-wider">
+          Loading Trip Control Sheet...
+        </p>
       </div>
     );
   }
 
-  if (error || !trip) {
+  if (!trip) {
     return (
       <div className="space-y-4">
-        <button onClick={onBack} className="text-slate-400 hover:text-white flex items-center gap-2 text-xs cursor-pointer">
-          <ArrowLeft size={14} /> Back to dispatches
+        <button
+          type="button"
+          onClick={onBack}
+          className="flex items-center gap-2 text-xs text-slate-400 hover:text-white"
+        >
+          <ArrowLeft size={14} /> Back to trips
         </button>
-        <div className="bg-red-950/20 border border-red-900 text-red-200 p-5 rounded-lg text-sm">
-          {error || "Trip ledger could not be retrieved."}
+        <div className="rounded-lg border border-red-900 bg-red-950/30 p-5 text-sm text-red-200">
+          <p>{error || "Trip not found."}</p>
+          <button
+            type="button"
+            onClick={() => void loadDetails()}
+            className="mt-3 inline-flex items-center gap-2 font-bold text-red-300 hover:text-white"
+          >
+            <RefreshCw size={14} /> Retry
+          </button>
         </div>
       </div>
     );
   }
 
-  const isDispatcherOrAdmin = user && [UserRole.ADMIN, UserRole.DISPATCHER].includes(user.role);
+  const isDispatcherOrAdmin = Boolean(
+    user &&
+      [UserRole.ADMIN, UserRole.DISPATCHER].includes(
+        user.role,
+      ),
+  );
+  const canComplete = Boolean(
+    user &&
+      [
+        UserRole.ADMIN,
+        UserRole.DISPATCHER,
+        UserRole.DRIVER,
+      ].includes(user.role) &&
+      trip.status === TripStatus.DISPATCHED,
+  );
+  const canDelete = Boolean(
+    user?.role === UserRole.ADMIN &&
+      [TripStatus.DRAFT, TripStatus.CANCELLED].includes(
+        trip.status,
+      ),
+  );
+  const capacityUsage =
+    trip.vehicle_capacity > 0
+      ? (trip.cargo_weight / trip.vehicle_capacity) * 100
+      : 0;
+  const revenuePerKm =
+    trip.planned_distance > 0
+      ? trip.revenue / trip.planned_distance
+      : 0;
 
   return (
     <div className="space-y-6">
-      {/* Back link */}
-      <button
-        onClick={onBack}
-        className="text-slate-400 hover:text-white flex items-center gap-2 text-xs cursor-pointer bg-transparent border-none"
-      >
-        <ArrowLeft size={14} /> Back to dispatches list
-      </button>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <button
+          type="button"
+          onClick={onBack}
+          className="flex items-center gap-2 text-xs text-slate-400 hover:text-white"
+        >
+          <ArrowLeft size={14} /> Back to trips list
+        </button>
 
-      {successMsg && (
-        <div className="bg-emerald-950/40 border border-emerald-900 text-emerald-200 px-4 py-3 rounded-lg text-sm font-semibold">
-          {successMsg}
+        <button
+          type="button"
+          onClick={() => void loadDetails()}
+          className="inline-flex items-center gap-2 self-start text-xs font-bold text-slate-400 hover:text-white sm:self-auto"
+        >
+          <RefreshCw size={14} /> Refresh
+        </button>
+      </div>
+
+      {successMessage && (
+        <div className="rounded-lg border border-emerald-900 bg-emerald-950/40 px-4 py-3 text-sm font-semibold text-emerald-200">
+          {successMessage}
         </div>
       )}
 
-      {/* Control console wrapper */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Route Details Panel */}
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-6 lg:col-span-2">
-          <div className="flex justify-between items-start border-b border-slate-800/60 pb-4">
+      {error && (
+        <div className="rounded-lg border border-red-900 bg-red-950/30 px-4 py-3 text-sm text-red-200">
+          {error}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <section className="space-y-6 rounded-xl border border-slate-800 bg-slate-900 p-6 lg:col-span-2">
+          <div className="flex flex-col gap-4 border-b border-slate-800/70 pb-5 sm:flex-row sm:items-start sm:justify-between">
             <div>
-              <span className="font-mono text-xs text-emerald-400 font-bold bg-emerald-950/50 border border-emerald-900/40 px-2.5 py-0.5 rounded uppercase">
+              <span className="rounded border border-emerald-900/40 bg-emerald-950/40 px-2.5 py-1 font-mono text-xs font-bold text-emerald-400">
                 {trip.trip_code}
               </span>
-              <h3 className="text-xl font-bold text-white mt-2 flex items-center gap-2">
+              <h2 className="mt-3 text-2xl font-bold text-white">
                 {trip.source} → {trip.destination}
-              </h3>
+              </h2>
+              <p className="mt-1 text-xs text-slate-500">
+                Created {formatDateTime(trip.created_at)}
+              </p>
+            </div>
+
+            <span
+              className={`self-start rounded-full border px-3 py-1 text-xs font-bold uppercase ${statusClasses(trip.status)}`}
+            >
+              {trip.status}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="rounded-xl border border-slate-800/60 bg-slate-950/40 p-4">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
+                Cargo
+              </span>
+              <p className="mt-2 font-semibold text-slate-200">
+                {trip.cargo_description}
+              </p>
+              <p className="mt-1 font-mono text-xs text-slate-400">
+                {trip.cargo_weight.toLocaleString()} kg / {trip.vehicle_capacity.toLocaleString()} kg
+              </p>
+              <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                <div
+                  className={`h-full rounded-full ${
+                    capacityUsage > 100
+                      ? "bg-red-500"
+                      : capacityUsage > 85
+                        ? "bg-amber-500"
+                        : "bg-emerald-500"
+                  }`}
+                  style={{
+                    width: `${Math.min(100, capacityUsage)}%`,
+                  }}
+                />
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-slate-800/60 bg-slate-950/40 p-4">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
+                Revenue
+              </span>
+              <p className="mt-2 font-mono text-xl font-bold text-emerald-400">
+                Rs. {trip.revenue.toLocaleString()}
+              </p>
+              <p className="mt-1 text-xs text-slate-500">
+                Rs. {revenuePerKm.toFixed(2)} per planned km
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 rounded-xl border border-slate-800 bg-slate-950/30 p-4 text-xs sm:grid-cols-2 lg:grid-cols-4">
+            <div>
+              <span className="block font-semibold uppercase text-slate-600">
+                Planned Departure
+              </span>
+              <span className="mt-1 block font-mono text-slate-300">
+                {formatDateTime(trip.planned_start_time)}
+              </span>
             </div>
             <div>
-              <span className={`inline-flex px-3 py-1 rounded-full text-xs font-bold uppercase border ${
-                trip.status === TripStatus.DRAFT ? "bg-slate-950 text-slate-400 border-slate-800" :
-                trip.status === TripStatus.DISPATCHED ? "bg-blue-950 text-blue-400 border-blue-900/40" :
-                trip.status === TripStatus.COMPLETED ? "bg-emerald-950 text-emerald-400 border-emerald-900/40" :
-                "bg-red-950 text-red-400 border-red-900/40"
-              }`}>
-                ● {trip.status}
+              <span className="block font-semibold uppercase text-slate-600">
+                Actual Departure
+              </span>
+              <span className="mt-1 block font-mono text-slate-300">
+                {formatDateTime(trip.actual_start_time)}
+              </span>
+            </div>
+            <div>
+              <span className="block font-semibold uppercase text-slate-600">
+                Completion
+              </span>
+              <span className="mt-1 block font-mono text-slate-300">
+                {formatDateTime(trip.completed_at)}
+              </span>
+            </div>
+            <div>
+              <span className="block font-semibold uppercase text-slate-600">
+                Distance
+              </span>
+              <span className="mt-1 block font-mono text-slate-300">
+                {(trip.actual_distance ?? trip.planned_distance).toLocaleString()} km
               </span>
             </div>
           </div>
 
-          {/* Details specs */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 text-sm text-slate-300">
-            {/* Cargo description */}
-            <div className="bg-slate-950/40 border border-slate-800/40 p-4 rounded-xl space-y-1">
-              <span className="block text-xs text-slate-500 uppercase font-bold tracking-wider">Cargo Ledger</span>
-              <span className="font-bold text-slate-200 block text-sm">{trip.cargo_description}</span>
-              <span className="font-mono text-xs text-slate-400 block mt-1">
-                Weight: {(trip.cargo_weight ?? 0).toLocaleString()} kg
-              </span>
-            </div>
-
-            {/* Financial Revenue */}
-            <div className="bg-slate-950/40 border border-slate-800/40 p-4 rounded-xl space-y-1">
-              <span className="block text-xs text-slate-500 uppercase font-bold tracking-wider">Estimated Revenue</span>
-              <span className="font-extrabold text-emerald-400 block text-lg font-mono">
-                Rs. {(trip.revenue ?? 0).toLocaleString()}
-              </span>
-              <span className="text-xs text-slate-500 block">
-                Planning Cost Index: Rs. {(trip.revenue / trip.planned_distance).toFixed(1)} / km
-              </span>
-            </div>
-          </div>
-
-          {/* Scheduled / Actual timelines */}
-          <div className="bg-slate-950/30 border border-slate-800 rounded-xl p-4 space-y-3.5 text-xs">
-            <h4 className="font-bold text-slate-300">Operations Log Sheet</h4>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div>
-                <span className="text-slate-500 block uppercase font-semibold">Planned Departure</span>
-                <span className="font-mono text-slate-300 block mt-1">
-                  {trip.planned_start_time ? new Date(trip.planned_start_time).toLocaleString() : "N/A"}
-                </span>
-              </div>
-              {trip.actual_start_time && (
+          {trip.status === TripStatus.COMPLETED && (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div className="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <Gauge size={18} className="text-blue-400" />
                 <div>
-                  <span className="text-slate-500 block uppercase font-semibold">Dispatched Departure</span>
-                  <span className="font-mono text-slate-300 block mt-1">
-                    {trip.actual_start_time ? new Date(trip.actual_start_time).toLocaleString() : "N/A"}
+                  <span className="block text-[10px] font-semibold uppercase text-slate-600">
+                    Final Odometer
+                  </span>
+                  <span className="font-mono font-bold text-slate-200">
+                    {(trip.final_odometer ?? 0).toLocaleString()} km
                   </span>
                 </div>
-              )}
-              {trip.actual_end_time && (
+              </div>
+              <div className="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <Fuel size={18} className="text-amber-400" />
                 <div>
-                  <span className="text-slate-500 block uppercase font-semibold">Arrival Timestamp</span>
-                  <span className="font-mono text-slate-300 block mt-1">
-                    {trip.actual_end_time ? new Date(trip.actual_end_time).toLocaleString() : "N/A"}
+                  <span className="block text-[10px] font-semibold uppercase text-slate-600">
+                    Fuel Consumed
+                  </span>
+                  <span className="font-mono font-bold text-slate-200">
+                    {(trip.fuel_consumed ?? 0).toLocaleString()} L
                   </span>
                 </div>
-              )}
-            </div>
-
-            {trip.notes && (
-              <div className="border-t border-slate-800/60 pt-3 mt-1">
-                <span className="text-slate-500 block uppercase font-semibold mb-1">Dispatcher Cautions</span>
-                <p className="text-slate-400 leading-relaxed italic">"{trip.notes}"</p>
               </div>
-            )}
-          </div>
-        </div>
-
-        {/* Assigned Resources & Workflow Sidebar */}
-        <div className="space-y-6">
-          {/* Asset matches */}
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-            <h4 className="font-bold text-slate-100 pb-2 border-b border-slate-800/60">Locked Dispatch Resources</h4>
-
-            {/* Vehicle Card */}
-            <div className="flex gap-3 items-center text-sm">
-              <div className="bg-slate-950 p-2.5 rounded-lg text-emerald-400">
-                <Truck size={20} />
-              </div>
-              <div className="overflow-hidden">
-                <span className="block text-[10px] text-slate-500 font-bold uppercase">Asset Profile</span>
-                <span className="font-bold text-slate-200 truncate block mt-0.5">{trip.vehicle_name}</span>
-                <span className="font-mono text-xs text-slate-400">{trip.vehicle_registration}</span>
-              </div>
-            </div>
-
-            {/* Driver Card */}
-            <div className="flex gap-3 items-center text-sm">
-              <div className="bg-slate-950 p-2.5 rounded-lg text-emerald-400">
-                <User size={20} />
-              </div>
-              <div className="overflow-hidden">
-                <span className="block text-[10px] text-slate-500 font-bold uppercase">Assigned Operator</span>
-                <span className="font-bold text-slate-200 truncate block mt-0.5">{trip.driver_name}</span>
-                <span className="font-mono text-xs text-slate-400">Licence: {trip.driver_licence}</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Workflow Transitions Box */}
-          {isDispatcherOrAdmin && (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-              <h4 className="font-bold text-slate-100 pb-2 border-b border-slate-800/60">Authorize Workflow Transitions</h4>
-
-              {trip.status === TripStatus.DRAFT && (
-                <div className="space-y-3">
-                  <button
-                    onClick={handleDispatch}
-                    className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-3 px-4 rounded-lg text-xs cursor-pointer flex items-center justify-center gap-2 transition-colors"
-                  >
-                    <Compass size={14} className="stroke-[2.5]" />
-                    <span>Authorize & Dispatch</span>
-                  </button>
-                  <button
-                    onClick={handleCancel}
-                    className="w-full bg-slate-800 hover:bg-red-950/20 hover:text-red-400 border border-slate-700 text-slate-400 font-bold py-3 px-4 rounded-lg text-xs cursor-pointer flex items-center justify-center gap-2 transition-colors"
-                  >
-                    <Ban size={14} />
-                    <span>Cancel Dispatch Plan</span>
-                  </button>
+              <div className="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <CheckCircle
+                  size={18}
+                  className="text-emerald-400"
+                />
+                <div>
+                  <span className="block text-[10px] font-semibold uppercase text-slate-600">
+                    Closure State
+                  </span>
+                  <span className="font-bold text-emerald-400">
+                    Resources Released
+                  </span>
                 </div>
-              )}
-
-              {trip.status === TripStatus.DISPATCHED && (
-                <div className="space-y-3">
-                  <button
-                    onClick={() => setShowCompleteModal(true)}
-                    className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-3 px-4 rounded-lg text-xs cursor-pointer flex items-center justify-center gap-2 transition-colors"
-                  >
-                    <CheckCircle size={14} className="stroke-[2.5]" />
-                    <span>Log Arrival & Complete</span>
-                  </button>
-                  <button
-                    onClick={handleCancel}
-                    className="w-full bg-slate-800 hover:bg-red-950/20 hover:text-red-400 border border-slate-700 text-slate-400 font-bold py-3 px-4 rounded-lg text-xs cursor-pointer flex items-center justify-center gap-2 transition-colors"
-                  >
-                    <Ban size={14} />
-                    <span>Abort active transit</span>
-                  </button>
-                </div>
-              )}
-
-              {trip.status === TripStatus.COMPLETED && (
-                <div className="bg-emerald-950/20 border border-emerald-900/60 p-4 rounded-lg text-xs text-emerald-400 flex gap-2.5 items-start">
-                  <CheckCircle size={16} className="shrink-0" />
-                  <div>
-                    <span className="font-bold uppercase tracking-wide block">Operations Closed</span>
-                    This transport log is completed. All assigned vehicle and driver resources have been unlocked and returned to Available status.
-                  </div>
-                </div>
-              )}
-
-              {trip.status === TripStatus.CANCELLED && (
-                <div className="bg-red-950/20 border border-red-900/60 p-4 rounded-lg text-xs text-red-400 flex gap-2.5 items-start">
-                  <ShieldAlert size={16} className="shrink-0" />
-                  <div>
-                    <span className="font-bold uppercase tracking-wide block">Dispatch Cancelled</span>
-                    This dispatch plan was aborted and logged as cancelled. All locked resources are immediately released.
-                  </div>
-                </div>
-              )}
+              </div>
             </div>
           )}
-        </div>
-      </div>
 
-      {/* Completion Modal */}
-      {showCompleteModal && (
-        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-md w-full p-6 shadow-2xl">
-            <div className="flex justify-between items-center border-b border-slate-800 pb-3 mb-5">
-              <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                <CheckCircle size={18} className="text-emerald-400" /> Close Operations Sheet
-              </h3>
-              <button
-                onClick={() => setShowCompleteModal(false)}
-                className="text-slate-500 hover:text-slate-300 text-lg font-bold bg-transparent border-none cursor-pointer"
-              >
-                ✕
-              </button>
+          {trip.notes && (
+            <div className="rounded-xl border border-slate-800 bg-slate-950/30 p-4">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">
+                Operational Notes
+              </span>
+              <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-400">
+                {trip.notes}
+              </p>
+            </div>
+          )}
+        </section>
+
+        <aside className="space-y-6">
+          <section className="space-y-4 rounded-xl border border-slate-800 bg-slate-900 p-5">
+            <h3 className="border-b border-slate-800/70 pb-3 font-bold text-slate-100">
+              Assigned Resources
+            </h3>
+
+            <div className="flex items-start gap-3">
+              <div className="rounded-lg bg-slate-950 p-2.5 text-emerald-400">
+                <Truck size={20} />
+              </div>
+              <div className="min-w-0">
+                <span className="text-[10px] font-bold uppercase text-slate-600">
+                  Vehicle
+                </span>
+                <p className="truncate font-bold text-slate-200">
+                  {trip.vehicle_name}
+                </p>
+                <p className="font-mono text-xs text-slate-500">
+                  {trip.vehicle_registration}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  {trip.vehicle_status.replaceAll("_", " ")} • {trip.vehicle_odometer.toLocaleString()} km
+                </p>
+              </div>
             </div>
 
-            {completeError && (
-              <div className="mb-4 bg-red-950/40 border border-red-900 text-red-200 p-3 rounded text-xs font-semibold">
-                {completeError}
+            <div className="flex items-start gap-3">
+              <div className="rounded-lg bg-slate-950 p-2.5 text-emerald-400">
+                <User size={20} />
+              </div>
+              <div className="min-w-0">
+                <span className="text-[10px] font-bold uppercase text-slate-600">
+                  Driver
+                </span>
+                <p className="truncate font-bold text-slate-200">
+                  {trip.driver_name}
+                </p>
+                <p className="font-mono text-xs text-slate-500">
+                  {trip.driver_licence}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  {trip.driver_status.replaceAll("_", " ")} • Score {trip.driver_score}/100
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <section className="space-y-3 rounded-xl border border-slate-800 bg-slate-900 p-5">
+            <h3 className="border-b border-slate-800/70 pb-3 font-bold text-slate-100">
+              Workflow Controls
+            </h3>
+
+            {isDispatcherOrAdmin &&
+              trip.status === TripStatus.DRAFT && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setShowEditModal(true)}
+                    disabled={actionLoading}
+                    className="flex w-full items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 text-xs font-bold text-slate-200 hover:bg-slate-700 disabled:opacity-50"
+                  >
+                    <Edit3 size={14} /> Edit Draft
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void runTransition(
+                        "dispatch",
+                        "Dispatch this trip? The selected vehicle and driver will become ON_TRIP.",
+                        "Trip dispatched successfully.",
+                      )
+                    }
+                    disabled={actionLoading}
+                    className="flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 px-4 py-3 text-xs font-bold text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
+                  >
+                    <Compass size={14} /> Authorize & Dispatch
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void runTransition(
+                        "cancel",
+                        "Cancel this draft trip?",
+                        "Draft trip cancelled.",
+                      )
+                    }
+                    disabled={actionLoading}
+                    className="flex w-full items-center justify-center gap-2 rounded-lg border border-red-900/60 bg-red-950/20 px-4 py-3 text-xs font-bold text-red-400 hover:bg-red-950/40 disabled:opacity-50"
+                  >
+                    <Ban size={14} /> Cancel Draft
+                  </button>
+                </>
+              )}
+
+            {canComplete && (
+              <button
+                type="button"
+                onClick={() => setShowCompleteModal(true)}
+                disabled={actionLoading}
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 px-4 py-3 text-xs font-bold text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
+              >
+                <CheckCircle size={14} /> Complete Trip
+              </button>
+            )}
+
+            {isDispatcherOrAdmin &&
+              trip.status === TripStatus.DISPATCHED && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    void runTransition(
+                      "cancel",
+                      "Abort this active trip? The vehicle and driver will be released.",
+                      "Active trip cancelled and resources released.",
+                    )
+                  }
+                  disabled={actionLoading}
+                  className="flex w-full items-center justify-center gap-2 rounded-lg border border-red-900/60 bg-red-950/20 px-4 py-3 text-xs font-bold text-red-400 hover:bg-red-950/40 disabled:opacity-50"
+                >
+                  <Ban size={14} /> Abort Active Trip
+                </button>
+              )}
+
+            {trip.status === TripStatus.COMPLETED && (
+              <div className="flex items-start gap-2 rounded-lg border border-emerald-900/60 bg-emerald-950/20 p-4 text-xs text-emerald-400">
+                <CheckCircle size={16} className="shrink-0" />
+                <span>
+                  This trip is completed. Vehicle and driver resources are available again.
+                </span>
               </div>
             )}
 
-            <form onSubmit={handleCompleteSubmit} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Actual Distance Completed (km)
-                </label>
-                <input
-                  type="number"
-                  value={completeForm.actual_distance}
-                  onChange={(e) => setCompleteForm({ ...completeForm, actual_distance: e.target.value })}
-                  placeholder="Planned was 105 km"
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                  required
-                />
+            {trip.status === TripStatus.CANCELLED && (
+              <div className="flex items-start gap-2 rounded-lg border border-red-900/60 bg-red-950/20 p-4 text-xs text-red-400">
+                <ShieldAlert size={16} className="shrink-0" />
+                <span>
+                  This trip was cancelled and cannot be dispatched again.
+                </span>
               </div>
+            )}
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Fuel Consumed during transit (Litres)
-                </label>
-                <input
-                  type="number"
-                  value={completeForm.fuel_consumed}
-                  onChange={(e) => setCompleteForm({ ...completeForm, fuel_consumed: e.target.value })}
-                  placeholder="15"
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                  required
-                />
-              </div>
+            {canDelete && (
+              <button
+                type="button"
+                onClick={() => void handleDelete()}
+                disabled={actionLoading}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-red-900/60 px-4 py-3 text-xs font-bold text-red-400 hover:bg-red-950/30 disabled:opacity-50"
+              >
+                <Trash2 size={14} /> Permanently Delete
+              </button>
+            )}
+          </section>
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Actual Arrival Time
-                </label>
-                <input
-                  type="datetime-local"
-                  value={completeForm.actual_end_time}
-                  onChange={(e) => setCompleteForm({ ...completeForm, actual_end_time: e.target.value })}
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs text-slate-100"
-                  required
-                />
-              </div>
+          <section className="rounded-xl border border-slate-800 bg-slate-900 p-5 text-xs text-slate-500">
+            <div className="flex items-center gap-2 font-bold uppercase text-slate-400">
+              <Calendar size={14} /> Audit Information
+            </div>
+            <p className="mt-3">Created: {formatDateTime(trip.created_at)}</p>
+            <p className="mt-1">Updated: {formatDateTime(trip.updated_at)}</p>
+          </section>
+        </aside>
+      </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Final Journey Notes
-                </label>
-                <textarea
-                  value={completeForm.notes}
-                  onChange={(e) => setCompleteForm({ ...completeForm, notes: e.target.value })}
-                  placeholder="Enter toll receipts details, fuel refuel records, or route notes..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 h-16 resize-none"
-                />
-              </div>
+      {showEditModal && (
+        <TripFormModal
+          mode="edit"
+          trip={trip}
+          onClose={() => setShowEditModal(false)}
+          onSaved={(message) => {
+            setShowEditModal(false);
+            showSuccess(message);
+            void loadDetails();
+          }}
+        />
+      )}
 
-              <div className="pt-4 flex justify-end gap-3 border-t border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setShowCompleteModal(false)}
-                  className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-white bg-transparent border border-slate-800 rounded-lg cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={completeLoading}
-                  className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-lg text-xs cursor-pointer transition-colors"
-                >
-                  {completeLoading ? "Closing Operations..." : "Authorize Completion"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+      {showCompleteModal && (
+        <CompleteTripModal
+          tripId={trip.id}
+          tripCode={trip.trip_code}
+          plannedDistance={trip.planned_distance}
+          currentOdometer={trip.vehicle_odometer}
+          currentRevenue={trip.revenue}
+          onClose={() => setShowCompleteModal(false)}
+          onCompleted={(message) => {
+            setShowCompleteModal(false);
+            showSuccess(message);
+            void loadDetails();
+          }}
+        />
       )}
     </div>
   );

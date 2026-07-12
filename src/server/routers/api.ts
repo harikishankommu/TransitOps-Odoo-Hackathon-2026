@@ -2758,65 +2758,280 @@ apiRouter.delete(
 // 5. TRIP MODULE ENDPOINTS
 // ============================================================================
 
+type TripSortField =
+  | "created_at"
+  | "trip_code"
+  | "planned_start_time"
+  | "planned_distance"
+  | "cargo_weight"
+  | "revenue"
+  | "status";
+
+const TRIP_SORT_FIELDS = new Set<TripSortField>([
+  "created_at",
+  "trip_code",
+  "planned_start_time",
+  "planned_distance",
+  "cargo_weight",
+  "revenue",
+  "status",
+]);
+
+const TRIP_WRITE_ROLES = [
+  UserRole.ADMIN,
+  UserRole.DISPATCHER,
+];
+
+function normalizeTripText(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function isTripStatus(value: unknown): value is TripStatus {
+  return (
+    typeof value === "string" &&
+    Object.values(TripStatus).includes(value as TripStatus)
+  );
+}
+
+function compareTripValues(
+  first: Trip,
+  second: Trip,
+  field: TripSortField,
+  order: 1 | -1,
+): number {
+  const firstValue = first[field];
+  const secondValue = second[field];
+
+  if (
+    typeof firstValue === "number" &&
+    typeof secondValue === "number"
+  ) {
+    return (firstValue - secondValue) * order;
+  }
+
+  return (
+    String(firstValue).localeCompare(
+      String(secondValue),
+      undefined,
+      {
+        numeric: true,
+        sensitivity: "base",
+      },
+    ) * order
+  );
+}
+
+function getDriverProfileForUser(userId: string): Driver | undefined {
+  return db.drivers.find(
+    (driver) => driver.user_id === userId,
+  );
+}
+
+function canDriverAccessTrip(
+  userId: string,
+  trip: Trip,
+): boolean {
+  const driverProfile = getDriverProfileForUser(userId);
+  return Boolean(
+    driverProfile && trip.driver_id === driverProfile.id,
+  );
+}
+
+function validateDraftTripResources(
+  vehicle: Vehicle,
+  driver: Driver,
+  cargoWeight: number,
+): string | null {
+  if (vehicle.status !== VehicleStatus.AVAILABLE) {
+    return `Vehicle ${vehicle.registration_number} is not available.`;
+  }
+
+  if (driver.status !== DriverStatus.AVAILABLE) {
+    return `Driver ${driver.full_name} is not available.`;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  if (driver.licence_expiry_date < today) {
+    return `Driver licence expired on ${driver.licence_expiry_date}.`;
+  }
+
+  if (cargoWeight > vehicle.maximum_load_capacity) {
+    return `Cargo weight of ${cargoWeight} kg exceeds vehicle capacity of ${vehicle.maximum_load_capacity} kg.`;
+  }
+
+  return null;
+}
+
+function serializeTrip(trip: Trip) {
+  const vehicle = db.vehicles.find(
+    (candidate) => candidate.id === trip.vehicle_id,
+  );
+  const driver = db.drivers.find(
+    (candidate) => candidate.id === trip.driver_id,
+  );
+  const today = new Date().toISOString().slice(0, 10);
+
+  return {
+    ...trip,
+    vehicle_name: vehicle?.vehicle_name ?? "Unknown Vehicle",
+    vehicle_registration:
+      vehicle?.registration_number ?? "Unknown",
+    vehicle_capacity:
+      vehicle?.maximum_load_capacity ?? 0,
+    vehicle_odometer: vehicle?.odometer ?? 0,
+    vehicle_status:
+      vehicle?.status ?? VehicleStatus.RETIRED,
+    driver_name: driver?.full_name ?? "Unknown Driver",
+    driver_licence: driver?.licence_number ?? "Unknown",
+    driver_licence_expiry:
+      driver?.licence_expiry_date ?? "",
+    driver_licence_valid: Boolean(
+      driver && driver.licence_expiry_date >= today,
+    ),
+    driver_phone: driver?.contact_number ?? "",
+    driver_score: driver?.safety_score ?? 0,
+    driver_status:
+      driver?.status ?? DriverStatus.SUSPENDED,
+  };
+}
+
 apiRouter.get(
   "/trips",
   authenticateJWT,
   requireRole(TRIP_READ_ROLES),
   (req: AuthenticatedRequest, res) => {
-  const { status, vehicle_id, driver_id, search } = req.query;
-
-  let list = [...db.trips];
-
-  // If driver, restrict view to only their assigned trips
-  if (req.user?.role === UserRole.DRIVER) {
-    const driverProfile = db.drivers.find(d => d.user_id === req.user?.id);
-    if (driverProfile) {
-      list = list.filter(t => t.driver_id === driverProfile.id);
-    } else {
-      list = []; // no profile, no trips
-    }
-  }
-
-  // Filters
-  if (status) {
-    list = list.filter(t => t.status === status);
-  }
-  if (vehicle_id) {
-    list = list.filter(t => t.vehicle_id === vehicle_id);
-  }
-  if (driver_id) {
-    list = list.filter(t => t.driver_id === driver_id);
-  }
-
-  if (search) {
-    const q = (search as string).toLowerCase();
-    list = list.filter(
-      t =>
-        t.trip_code.toLowerCase().includes(q) ||
-        t.source.toLowerCase().includes(q) ||
-        t.destination.toLowerCase().includes(q) ||
-        t.cargo_description.toLowerCase().includes(q)
+    const search = getSingleQueryValue(
+      req.query.search,
+    ).toLowerCase();
+    const status = getSingleQueryValue(
+      req.query.status,
     );
-  }
+    const vehicleId = getSingleQueryValue(
+      req.query.vehicle_id,
+    );
+    const driverId = getSingleQueryValue(
+      req.query.driver_id,
+    );
+    const requestedSortField =
+      getSingleQueryValue(req.query.sort_by) ||
+      "created_at";
+    const requestedSortOrder =
+      getSingleQueryValue(req.query.sort_order) ||
+      "desc";
 
-  // Sort by created_at newest first
-  list.sort((a, b) => b.created_at.localeCompare(a.created_at));
+    if (status && !isTripStatus(status)) {
+      return res.status(400).json({
+        error: "Invalid trip status filter.",
+      });
+    }
 
-  // Denormalize vehicles and drivers for response
-  const result = list.map(t => {
-    const vehicle = db.vehicles.find(v => v.id === t.vehicle_id);
-    const driver = db.drivers.find(d => d.id === t.driver_id);
-    return {
-      ...t,
-      vehicle_name: vehicle ? `${vehicle.vehicle_name} (${vehicle.registration_number})` : "Unknown Vehicle",
-      vehicle_capacity: vehicle?.maximum_load_capacity || 0,
-      driver_name: driver ? driver.full_name : "Unknown Driver",
-      driver_licence_valid: driver ? driver.licence_expiry_date >= new Date().toISOString().split("T")[0] : false
-    };
-  });
+    if (
+      !TRIP_SORT_FIELDS.has(
+        requestedSortField as TripSortField,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Invalid trip sort field.",
+      });
+    }
 
-  res.json(result);
-});
+    if (
+      requestedSortOrder !== "asc" &&
+      requestedSortOrder !== "desc"
+    ) {
+      return res.status(400).json({
+        error: "Trip sort order must be asc or desc.",
+      });
+    }
+
+    let list = [...db.trips];
+
+    if (req.user?.role === UserRole.DRIVER) {
+      const driverProfile = getDriverProfileForUser(
+        req.user.id,
+      );
+      list = driverProfile
+        ? list.filter(
+            (trip) => trip.driver_id === driverProfile.id,
+          )
+        : [];
+    }
+
+    if (search) {
+      list = list.filter((trip) =>
+        [
+          trip.trip_code,
+          trip.source,
+          trip.destination,
+          trip.cargo_description,
+        ].some((value) =>
+          value.toLowerCase().includes(search),
+        ),
+      );
+    }
+
+    if (status) {
+      list = list.filter(
+        (trip) => trip.status === status,
+      );
+    }
+
+    if (vehicleId) {
+      list = list.filter(
+        (trip) => trip.vehicle_id === vehicleId,
+      );
+    }
+
+    if (driverId) {
+      list = list.filter(
+        (trip) => trip.driver_id === driverId,
+      );
+    }
+
+    const sortField =
+      requestedSortField as TripSortField;
+    const sortOrder: 1 | -1 =
+      requestedSortOrder === "asc" ? 1 : -1;
+
+    list.sort((first, second) =>
+      compareTripValues(
+        first,
+        second,
+        sortField,
+        sortOrder,
+      ),
+    );
+
+    const pageSize = parsePositiveInteger(
+      req.query.page_size,
+      10,
+      100,
+    );
+    const requestedPage = parsePositiveInteger(
+      req.query.page,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const total = list.length;
+    const totalPages = Math.max(
+      1,
+      Math.ceil(total / pageSize),
+    );
+    const page = Math.min(requestedPage, totalPages);
+    const startIndex = (page - 1) * pageSize;
+    const data = list
+      .slice(startIndex, startIndex + pageSize)
+      .map(serializeTrip);
+
+    return res.json({
+      data,
+      total,
+      page,
+      page_size: pageSize,
+      total_pages: totalPages,
+    });
+  },
+);
 
 apiRouter.get(
   "/trips/:id",
@@ -2824,8 +3039,7 @@ apiRouter.get(
   requireRole(TRIP_READ_ROLES),
   (req: AuthenticatedRequest, res) => {
     const trip = db.trips.find(
-      (candidate) =>
-        candidate.id === req.params.id,
+      (candidate) => candidate.id === req.params.id,
     );
 
     if (!trip) {
@@ -2834,242 +3048,586 @@ apiRouter.get(
       });
     }
 
-    if (req.user?.role === UserRole.DRIVER) {
-      const driverProfile = db.drivers.find(
-        (driver) =>
-          driver.user_id === req.user?.id,
-      );
+    if (
+      req.user?.role === UserRole.DRIVER &&
+      !canDriverAccessTrip(req.user.id, trip)
+    ) {
+      return res.status(403).json({
+        error:
+          "You can only view trips assigned to your driver profile.",
+      });
+    }
 
-      if (
-        !driverProfile ||
-        trip.driver_id !== driverProfile.id
-      ) {
-        return res.status(403).json({
-          error:
-            "You can only view trips assigned to your driver profile.",
+    return res.json(serializeTrip(trip));
+  },
+);
+
+apiRouter.post(
+  "/trips",
+  authenticateJWT,
+  requireRole(TRIP_WRITE_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const body = req.body ?? {};
+
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error: "A valid trip payload is required.",
+      });
+    }
+
+    const source =
+      typeof body.source === "string"
+        ? normalizeTripText(body.source)
+        : "";
+    const destination =
+      typeof body.destination === "string"
+        ? normalizeTripText(body.destination)
+        : "";
+    const cargoDescription =
+      typeof body.cargo_description === "string"
+        ? normalizeTripText(body.cargo_description)
+        : "";
+    const notes =
+      typeof body.notes === "string"
+        ? body.notes.trim()
+        : undefined;
+    const vehicleId =
+      typeof body.vehicle_id === "string"
+        ? body.vehicle_id.trim()
+        : "";
+    const driverId =
+      typeof body.driver_id === "string"
+        ? body.driver_id.trim()
+        : "";
+    const cargoWeight = parseFiniteNumber(
+      body.cargo_weight,
+    );
+    const plannedDistance = parseFiniteNumber(
+      body.planned_distance,
+    );
+    const revenue =
+      body.revenue === undefined
+        ? 0
+        : parseFiniteNumber(body.revenue);
+    const plannedStartTime =
+      typeof body.planned_start_time === "string"
+        ? body.planned_start_time.trim()
+        : "";
+    const plannedStartDate = new Date(
+      plannedStartTime,
+    );
+
+    if (source.length < 2 || source.length > 120) {
+      return res.status(400).json({
+        error:
+          "Source must contain between 2 and 120 characters.",
+      });
+    }
+
+    if (
+      destination.length < 2 ||
+      destination.length > 120
+    ) {
+      return res.status(400).json({
+        error:
+          "Destination must contain between 2 and 120 characters.",
+      });
+    }
+
+    if (source.toLowerCase() === destination.toLowerCase()) {
+      return res.status(400).json({
+        error: "Source and destination must be different.",
+      });
+    }
+
+    if (
+      cargoDescription.length < 2 ||
+      cargoDescription.length > 240
+    ) {
+      return res.status(400).json({
+        error:
+          "Cargo description must contain between 2 and 240 characters.",
+      });
+    }
+
+    if (cargoWeight === null || cargoWeight <= 0) {
+      return res.status(400).json({
+        error: "Cargo weight must be greater than zero.",
+      });
+    }
+
+    if (
+      plannedDistance === null ||
+      plannedDistance <= 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Planned distance must be greater than zero.",
+      });
+    }
+
+    if (revenue === null || revenue < 0) {
+      return res.status(400).json({
+        error: "Revenue must be zero or greater.",
+      });
+    }
+
+    if (Number.isNaN(plannedStartDate.getTime())) {
+      return res.status(400).json({
+        error: "A valid planned departure time is required.",
+      });
+    }
+
+    if (notes && notes.length > 1000) {
+      return res.status(400).json({
+        error: "Notes cannot exceed 1000 characters.",
+      });
+    }
+
+    const vehicle = db.vehicles.find(
+      (candidate) => candidate.id === vehicleId,
+    );
+    const driver = db.drivers.find(
+      (candidate) => candidate.id === driverId,
+    );
+
+    if (!vehicle) {
+      return res.status(400).json({
+        error: "Selected vehicle does not exist.",
+      });
+    }
+
+    if (!driver) {
+      return res.status(400).json({
+        error: "Selected driver does not exist.",
+      });
+    }
+
+    const resourceError = validateDraftTripResources(
+      vehicle,
+      driver,
+      cargoWeight,
+    );
+
+    if (resourceError) {
+      return res.status(409).json({
+        error: resourceError,
+      });
+    }
+
+    const now = new Date().toISOString();
+    const trip: Trip = {
+      id: db.generateId("tr"),
+      trip_code: OperationsService.generateTripCode(),
+      source,
+      destination,
+      vehicle_id: vehicle.id,
+      driver_id: driver.id,
+      cargo_description: cargoDescription,
+      cargo_weight: cargoWeight,
+      planned_distance: plannedDistance,
+      planned_start_time:
+        plannedStartDate.toISOString(),
+      revenue,
+      notes,
+      status: TripStatus.DRAFT,
+      created_by: req.user!.id,
+      created_at: now,
+      updated_at: now,
+    };
+
+    db.trips.push(trip);
+
+    try {
+      db.save();
+    } catch (error) {
+      const index = db.trips.findIndex(
+        (candidate) => candidate.id === trip.id,
+      );
+      if (index >= 0) {
+        db.trips.splice(index, 1);
+      }
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Created draft trip ${trip.trip_code}`,
+      "TRIP",
+      trip.id,
+    );
+
+    return res.status(201).json(
+      serializeTrip(trip),
+    );
+  },
+);
+
+apiRouter.put(
+  "/trips/:id",
+  authenticateJWT,
+  requireRole(TRIP_WRITE_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const tripIndex = db.trips.findIndex(
+      (candidate) => candidate.id === req.params.id,
+    );
+
+    if (tripIndex === -1) {
+      return res.status(404).json({
+        error: "Trip not found.",
+      });
+    }
+
+    const currentTrip = db.trips[tripIndex];
+
+    if (currentTrip.status !== TripStatus.DRAFT) {
+      return res.status(409).json({
+        error: "Only draft trips can be edited.",
+      });
+    }
+
+    const body = req.body ?? {};
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error: "A valid trip payload is required.",
+      });
+    }
+
+    if (hasOwnProperty(body, "status")) {
+      return res.status(400).json({
+        error:
+          "Trip status is controlled by dispatch, completion, and cancellation workflows.",
+      });
+    }
+
+    const updatedTrip: Trip = {
+      ...currentTrip,
+    };
+
+    if (hasOwnProperty(body, "source")) {
+      if (typeof body.source !== "string") {
+        return res.status(400).json({
+          error: "Source must be a string.",
         });
       }
+      updatedTrip.source = normalizeTripText(body.source);
+    }
+
+    if (hasOwnProperty(body, "destination")) {
+      if (typeof body.destination !== "string") {
+        return res.status(400).json({
+          error: "Destination must be a string.",
+        });
+      }
+      updatedTrip.destination = normalizeTripText(
+        body.destination,
+      );
+    }
+
+    if (hasOwnProperty(body, "vehicle_id")) {
+      if (typeof body.vehicle_id !== "string") {
+        return res.status(400).json({
+          error: "Vehicle ID must be a string.",
+        });
+      }
+      updatedTrip.vehicle_id = body.vehicle_id.trim();
+    }
+
+    if (hasOwnProperty(body, "driver_id")) {
+      if (typeof body.driver_id !== "string") {
+        return res.status(400).json({
+          error: "Driver ID must be a string.",
+        });
+      }
+      updatedTrip.driver_id = body.driver_id.trim();
+    }
+
+    if (hasOwnProperty(body, "cargo_description")) {
+      if (typeof body.cargo_description !== "string") {
+        return res.status(400).json({
+          error: "Cargo description must be a string.",
+        });
+      }
+      updatedTrip.cargo_description = normalizeTripText(
+        body.cargo_description,
+      );
+    }
+
+    if (hasOwnProperty(body, "cargo_weight")) {
+      const cargoWeight = parseFiniteNumber(
+        body.cargo_weight,
+      );
+      if (cargoWeight === null || cargoWeight <= 0) {
+        return res.status(400).json({
+          error: "Cargo weight must be greater than zero.",
+        });
+      }
+      updatedTrip.cargo_weight = cargoWeight;
+    }
+
+    if (hasOwnProperty(body, "planned_distance")) {
+      const plannedDistance = parseFiniteNumber(
+        body.planned_distance,
+      );
+      if (
+        plannedDistance === null ||
+        plannedDistance <= 0
+      ) {
+        return res.status(400).json({
+          error:
+            "Planned distance must be greater than zero.",
+        });
+      }
+      updatedTrip.planned_distance = plannedDistance;
+    }
+
+    if (hasOwnProperty(body, "planned_start_time")) {
+      if (typeof body.planned_start_time !== "string") {
+        return res.status(400).json({
+          error:
+            "Planned departure time must be a string.",
+        });
+      }
+      const plannedStartDate = new Date(
+        body.planned_start_time,
+      );
+      if (Number.isNaN(plannedStartDate.getTime())) {
+        return res.status(400).json({
+          error:
+            "A valid planned departure time is required.",
+        });
+      }
+      updatedTrip.planned_start_time =
+        plannedStartDate.toISOString();
+    }
+
+    if (hasOwnProperty(body, "revenue")) {
+      const revenue = parseFiniteNumber(body.revenue);
+      if (revenue === null || revenue < 0) {
+        return res.status(400).json({
+          error: "Revenue must be zero or greater.",
+        });
+      }
+      updatedTrip.revenue = revenue;
+    }
+
+    if (hasOwnProperty(body, "notes")) {
+      if (
+        body.notes !== undefined &&
+        body.notes !== null &&
+        typeof body.notes !== "string"
+      ) {
+        return res.status(400).json({
+          error: "Notes must be a string.",
+        });
+      }
+      const notes =
+        typeof body.notes === "string"
+          ? body.notes.trim()
+          : "";
+      updatedTrip.notes = notes || undefined;
+    }
+
+    if (
+      updatedTrip.source.length < 2 ||
+      updatedTrip.source.length > 120
+    ) {
+      return res.status(400).json({
+        error:
+          "Source must contain between 2 and 120 characters.",
+      });
+    }
+
+    if (
+      updatedTrip.destination.length < 2 ||
+      updatedTrip.destination.length > 120
+    ) {
+      return res.status(400).json({
+        error:
+          "Destination must contain between 2 and 120 characters.",
+      });
+    }
+
+    if (
+      updatedTrip.source.toLowerCase() ===
+      updatedTrip.destination.toLowerCase()
+    ) {
+      return res.status(400).json({
+        error: "Source and destination must be different.",
+      });
+    }
+
+    if (
+      updatedTrip.cargo_description.length < 2 ||
+      updatedTrip.cargo_description.length > 240
+    ) {
+      return res.status(400).json({
+        error:
+          "Cargo description must contain between 2 and 240 characters.",
+      });
+    }
+
+    if ((updatedTrip.notes?.length ?? 0) > 1000) {
+      return res.status(400).json({
+        error: "Notes cannot exceed 1000 characters.",
+      });
     }
 
     const vehicle = db.vehicles.find(
       (candidate) =>
-        candidate.id === trip.vehicle_id,
+        candidate.id === updatedTrip.vehicle_id,
     );
-
     const driver = db.drivers.find(
       (candidate) =>
-        candidate.id === trip.driver_id,
+        candidate.id === updatedTrip.driver_id,
     );
 
-    return res.json({
-      ...trip,
+    if (!vehicle) {
+      return res.status(400).json({
+        error: "Selected vehicle does not exist.",
+      });
+    }
 
-      vehicle_name: vehicle
-        ? `${vehicle.vehicle_name} (${vehicle.registration_number})`
-        : "Unknown Vehicle",
+    if (!driver) {
+      return res.status(400).json({
+        error: "Selected driver does not exist.",
+      });
+    }
 
-      vehicle_capacity:
-        vehicle?.maximum_load_capacity ?? 0,
+    const resourceError = validateDraftTripResources(
+      vehicle,
+      driver,
+      updatedTrip.cargo_weight,
+    );
 
-      vehicle_reg:
-        vehicle?.registration_number,
+    if (resourceError) {
+      return res.status(409).json({
+        error: resourceError,
+      });
+    }
 
-      driver_name:
-        driver?.full_name ?? "Unknown Driver",
+    updatedTrip.updated_at = new Date().toISOString();
+    db.trips[tripIndex] = updatedTrip;
 
-      driver_licence:
-        driver?.licence_number,
+    try {
+      db.save();
+    } catch (error) {
+      db.trips[tripIndex] = currentTrip;
+      throw error;
+    }
 
-      driver_licence_expiry:
-        driver?.licence_expiry_date,
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Updated draft trip ${updatedTrip.trip_code}`,
+      "TRIP",
+      updatedTrip.id,
+    );
 
-      driver_phone:
-        driver?.contact_number,
-
-      driver_score:
-        driver?.safety_score,
-    });
+    return res.json(serializeTrip(updatedTrip));
   },
 );
 
-apiRouter.post("/trips", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
-  const {
-    source,
-    destination,
-    vehicle_id,
-    driver_id,
-    cargo_description,
-    cargo_weight,
-    planned_distance,
-    planned_start_time,
-    revenue,
-    notes
-  } = req.body;
+apiRouter.delete(
+  "/trips/:id",
+  authenticateJWT,
+  requireRole([UserRole.ADMIN]),
+  (req: AuthenticatedRequest, res) => {
+    const index = db.trips.findIndex(
+      (candidate) => candidate.id === req.params.id,
+    );
 
-  if (!source || !destination || !vehicle_id || !driver_id || !cargo_description || !cargo_weight || !planned_distance || !planned_start_time) {
-    return res.status(400).json({ error: "Missing required trip details." });
-  }
+    if (index === -1) {
+      return res.status(404).json({
+        error: "Trip not found.",
+      });
+    }
 
-  const weight = Number(cargo_weight);
-  const dist = Number(planned_distance);
-  const rev = Number(revenue || 0);
+    const trip = db.trips[index];
 
-  if (weight <= 0) return res.status(400).json({ error: "Cargo weight must be positive." });
-  if (dist <= 0) return res.status(400).json({ error: "Planned distance must be positive." });
-  if (rev < 0) return res.status(400).json({ error: "Revenue cannot be negative." });
+    if (
+      ![
+        TripStatus.DRAFT,
+        TripStatus.CANCELLED,
+      ].includes(trip.status)
+    ) {
+      return res.status(409).json({
+        error:
+          "Only draft or cancelled trips can be permanently deleted.",
+      });
+    }
 
-  const vehicle = db.vehicles.find(v => v.id === vehicle_id);
-  if (!vehicle) return res.status(400).json({ error: "Selected vehicle does not exist." });
+    const linkedFuelLogs = db.fuel_logs.filter(
+      (fuelLog) => fuelLog.trip_id === trip.id,
+    ).length;
+    const linkedExpenses = db.expenses.filter(
+      (expense) => expense.trip_id === trip.id,
+    ).length;
 
-  const driver = db.drivers.find(d => d.id === driver_id);
-  if (!driver) return res.status(400).json({ error: "Selected driver does not exist." });
+    if (linkedFuelLogs > 0 || linkedExpenses > 0) {
+      return res.status(409).json({
+        error:
+          "This trip has financial history and cannot be deleted.",
+        references: {
+          fuel_logs: linkedFuelLogs,
+          expenses: linkedExpenses,
+        },
+      });
+    }
 
-  // Warning check in creation too (cargo weight cannot exceed vehicle capacity)
-  if (weight > vehicle.maximum_load_capacity) {
-    return res.status(400).json({
-      error: `Cargo weight of ${weight} kg exceeds selected vehicle's capacity of ${vehicle.maximum_load_capacity} kg.`
-    });
-  }
+    db.trips.splice(index, 1);
 
-  // Create DRAFT trip
-  const newTrip: Trip = {
-    id: "tr_" + Math.random().toString(36).substr(2, 9),
-    trip_code: OperationsService.generateTripCode(),
-    source,
-    destination,
-    vehicle_id,
-    driver_id,
-    cargo_description,
-    cargo_weight: weight,
-    planned_distance: dist,
-    planned_start_time,
-    revenue: rev,
-    notes,
-    status: TripStatus.DRAFT,
-    created_by: req.user!.id,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
+    try {
+      db.save();
+    } catch (error) {
+      db.trips.splice(index, 0, trip);
+      throw error;
+    }
 
-  db.trips.push(newTrip);
-  db.save();
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Deleted trip ${trip.trip_code}`,
+      "TRIP",
+      trip.id,
+    );
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Created draft trip ${newTrip.trip_code}`,
-    "TRIP",
-    newTrip.id
-  );
+    return res.json({ success: true });
+  },
+);
 
-  res.status(201).json(newTrip);
-});
+apiRouter.post(
+  "/trips/:id/dispatch",
+  authenticateJWT,
+  requireRole(TRIP_WRITE_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    try {
+      const trip = OperationsService.dispatchTrip(
+        req.params.id,
+        {
+          id: req.user!.id,
+          name: req.user!.full_name,
+        },
+      );
 
-apiRouter.put("/trips/:id", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
-  const trip = db.trips.find(t => t.id === req.params.id);
-  if (!trip) return res.status(404).json({ error: "Trip not found." });
-
-  if (trip.status !== TripStatus.DRAFT) {
-    return res.status(400).json({ error: "Only draft trips can be updated." });
-  }
-
-  const {
-    source,
-    destination,
-    vehicle_id,
-    driver_id,
-    cargo_description,
-    cargo_weight,
-    planned_distance,
-    planned_start_time,
-    revenue,
-    notes
-  } = req.body;
-
-  if (vehicle_id) {
-    const vehicle = db.vehicles.find(v => v.id === vehicle_id);
-    if (!vehicle) return res.status(400).json({ error: "Vehicle not found." });
-    trip.vehicle_id = vehicle_id;
-  }
-
-  if (driver_id) {
-    const driver = db.drivers.find(d => d.id === driver_id);
-    if (!driver) return res.status(400).json({ error: "Driver not found." });
-    trip.driver_id = driver_id;
-  }
-
-  if (source) trip.source = source;
-  if (destination) trip.destination = destination;
-  if (cargo_description) trip.cargo_description = cargo_description;
-  if (planned_start_time) trip.planned_start_time = planned_start_time;
-  if (notes !== undefined) trip.notes = notes;
-
-  if (cargo_weight !== undefined) {
-    const weight = Number(cargo_weight);
-    if (weight <= 0) return res.status(400).json({ error: "Cargo weight must be positive." });
-    trip.cargo_weight = weight;
-  }
-
-  if (planned_distance !== undefined) {
-    const dist = Number(planned_distance);
-    if (dist <= 0) return res.status(400).json({ error: "Planned distance must be positive." });
-    trip.planned_distance = dist;
-  }
-
-  if (revenue !== undefined) {
-    const rev = Number(revenue);
-    if (rev < 0) return res.status(400).json({ error: "Revenue cannot be negative." });
-    trip.revenue = rev;
-  }
-
-  trip.updated_at = new Date().toISOString();
-  db.save();
-
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Updated trip ${trip.trip_code}`,
-    "TRIP",
-    trip.id
-  );
-
-  res.json(trip);
-});
-
-apiRouter.delete("/trips/:id", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
-  const index = db.trips.findIndex(t => t.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Trip not found." });
-
-  const trip = db.trips[index];
-  if (trip.status === TripStatus.DISPATCHED) {
-    return res.status(400).json({ error: "Cannot delete a dispatched trip. Cancel it first." });
-  }
-
-  db.trips.splice(index, 1);
-  db.save();
-
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Deleted trip ${trip.trip_code}`,
-    "TRIP",
-    trip.id
-  );
-
-  res.json({ success: true });
-});
-
-// Operations Transitions Endpoints
-
-apiRouter.post("/trips/:id/dispatch", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
-  try {
-    const dispatcher = { id: req.user!.id, name: req.user!.full_name };
-    const trip = OperationsService.dispatchTrip(req.params.id, dispatcher);
-    res.json(trip);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
+      return res.json(serializeTrip(trip));
+    } catch (error: unknown) {
+      return res.status(409).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to dispatch the trip.",
+      });
+    }
+  },
+);
 
 apiRouter.post(
   "/trips/:id/complete",
@@ -3080,105 +3638,134 @@ apiRouter.post(
     UserRole.DRIVER,
   ]),
   (req: AuthenticatedRequest, res) => {
+    const trip = db.trips.find(
+      (candidate) => candidate.id === req.params.id,
+    );
+
+    if (!trip) {
+      return res.status(404).json({
+        error: "Trip not found.",
+      });
+    }
+
+    if (
+      req.user?.role === UserRole.DRIVER &&
+      !canDriverAccessTrip(req.user.id, trip)
+    ) {
+      return res.status(403).json({
+        error:
+          "You can only complete a trip assigned to your driver profile.",
+      });
+    }
+
+    const body = req.body ?? {};
+    const actualDistance = parseFiniteNumber(
+      body.actual_distance,
+    );
+    const finalOdometer = parseFiniteNumber(
+      body.final_odometer,
+    );
+    const fuelConsumed = parseFiniteNumber(
+      body.fuel_consumed,
+    );
+    const revenue =
+      body.revenue === undefined
+        ? undefined
+        : parseFiniteNumber(body.revenue);
+    const notes =
+      typeof body.notes === "string"
+        ? body.notes.trim()
+        : undefined;
+
+    if (
+      actualDistance === null ||
+      actualDistance <= 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Actual distance must be greater than zero.",
+      });
+    }
+
+    if (finalOdometer === null || finalOdometer < 0) {
+      return res.status(400).json({
+        error:
+          "Final odometer must be zero or greater.",
+      });
+    }
+
+    if (fuelConsumed === null || fuelConsumed < 0) {
+      return res.status(400).json({
+        error:
+          "Fuel consumed must be zero or greater.",
+      });
+    }
+
+    if (revenue === null || (revenue !== undefined && revenue < 0)) {
+      return res.status(400).json({
+        error: "Revenue must be zero or greater.",
+      });
+    }
+
+    if (notes && notes.length > 1000) {
+      return res.status(400).json({
+        error: "Notes cannot exceed 1000 characters.",
+      });
+    }
+
     try {
-      const existingTrip = db.trips.find(
-        (trip) => trip.id === req.params.id,
-      );
-
-      if (!existingTrip) {
-        return res.status(404).json({
-          error: "Trip not found.",
-        });
-      }
-
-      if (req.user?.role === UserRole.DRIVER) {
-        const driverProfile = db.drivers.find(
-          (driver) =>
-            driver.user_id === req.user?.id,
-        );
-
-        if (
-          !driverProfile ||
-          existingTrip.driver_id !==
-            driverProfile.id
-        ) {
-          return res.status(403).json({
-            error:
-              "You can only complete a trip assigned to your driver profile.",
-          });
-        }
-      }
-
-      const {
-        actual_distance,
-        final_odometer,
-        fuel_consumed,
-        revenue,
-        notes,
-      } = req.body ?? {};
-
-      if (
-        actual_distance === undefined ||
-        final_odometer === undefined ||
-        fuel_consumed === undefined
-      ) {
-        return res.status(400).json({
-          error:
-            "Actual distance, final odometer, and fuel consumed are required to complete a trip.",
-        });
-      }
-
-      const operator = {
-        id: req.user!.id,
-        name: req.user!.full_name,
-      };
-
-      const trip = OperationsService.completeTrip(
-        req.params.id,
+      const completedTrip = OperationsService.completeTrip(
+        trip.id,
         {
-          actual_distance:
-            Number(actual_distance),
-
-          final_odometer:
-            Number(final_odometer),
-
-          fuel_consumed:
-            Number(fuel_consumed),
-
-          revenue:
-            revenue !== undefined
-              ? Number(revenue)
-              : undefined,
-
+          actual_distance: actualDistance,
+          final_odometer: finalOdometer,
+          fuel_consumed: fuelConsumed,
+          revenue,
           notes,
         },
-        operator,
+        {
+          id: req.user!.id,
+          name: req.user!.full_name,
+        },
       );
 
-      return res.json(trip);
+      return res.json(serializeTrip(completedTrip));
     } catch (error: unknown) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "Unable to complete the trip.";
-
-      return res.status(400).json({
-        error: message,
+      return res.status(409).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to complete the trip.",
       });
     }
   },
 );
 
-apiRouter.post("/trips/:id/cancel", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
-  try {
-    const operator = { id: req.user!.id, name: req.user!.full_name };
-    const trip = OperationsService.cancelTrip(req.params.id, operator);
-    res.json(trip);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
+apiRouter.post(
+  "/trips/:id/cancel",
+  authenticateJWT,
+  requireRole(TRIP_WRITE_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    try {
+      const trip = OperationsService.cancelTrip(
+        req.params.id,
+        {
+          id: req.user!.id,
+          name: req.user!.full_name,
+        },
+      );
 
+      return res.json(serializeTrip(trip));
+    } catch (error: unknown) {
+      return res.status(409).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to cancel the trip.",
+      });
+    }
+  },
+);
 
 // ============================================================================
 // 6. MAINTENANCE MODULE ENDPOINTS

@@ -17,160 +17,190 @@ import {
 
 export class OperationsService {
   /**
-   * Generates a unique trip code (e.g. TRIP-0003)
+   * Generates a unique trip code, for example TRIP-0005.
    */
   public static generateTripCode(): string {
-    const existing = db.trips;
-    let maxId = 0;
-    for (const t of existing) {
-      const match = t.trip_code.match(/TRIP-(\d+)/);
-      if (match) {
-        const val = parseInt(match[1], 10);
-        if (val > maxId) maxId = val;
+    let maximum = 0;
+
+    for (const trip of db.trips) {
+      const match = /^TRIP-(\d+)$/.exec(trip.trip_code);
+      if (!match) {
+        continue;
+      }
+
+      const value = Number.parseInt(match[1], 10);
+      if (value > maximum) {
+        maximum = value;
       }
     }
-    const nextNum = maxId + 1;
-    return "TRIP-" + String(nextNum).padStart(4, "0");
+
+    return `TRIP-${String(maximum + 1).padStart(4, "0")}`;
   }
 
   /**
-   * Enforces vehicle validations before dispatch
+   * Ensures a vehicle is eligible for dispatch.
    */
-  public static validateVehicleForDispatch(vehicle: Vehicle, tripId: string) {
-    if (vehicle.status === VehicleStatus.ON_TRIP) {
-      throw new Error(`Vehicle ${vehicle.registration_number} is currently on a trip.`);
-    }
-    if (vehicle.status === VehicleStatus.IN_SHOP) {
-      throw new Error(`Vehicle ${vehicle.registration_number} is under maintenance.`);
-    }
-    if (vehicle.status === VehicleStatus.RETIRED) {
-      throw new Error(`Vehicle ${vehicle.registration_number} has been retired.`);
+  public static validateVehicleForDispatch(
+    vehicle: Vehicle,
+    tripId: string,
+  ): void {
+    if (vehicle.status !== VehicleStatus.AVAILABLE) {
+      const reason =
+        vehicle.status === VehicleStatus.ON_TRIP
+          ? "currently on a trip"
+          : vehicle.status === VehicleStatus.IN_SHOP
+            ? "under maintenance"
+            : "retired";
+
+      throw new Error(
+        `Vehicle ${vehicle.registration_number} is ${reason}.`,
+      );
     }
 
-    // Check if double-assigned to another DISPATCHED trip
     const activeTrip = db.trips.find(
-      t => t.id !== tripId && t.vehicle_id === vehicle.id && t.status === TripStatus.DISPATCHED
+      (trip) =>
+        trip.id !== tripId &&
+        trip.vehicle_id === vehicle.id &&
+        trip.status === TripStatus.DISPATCHED,
     );
+
     if (activeTrip) {
-      throw new Error(`Vehicle ${vehicle.registration_number} is currently assigned to another active trip ${activeTrip.trip_code}.`);
+      throw new Error(
+        `Vehicle ${vehicle.registration_number} is assigned to active trip ${activeTrip.trip_code}.`,
+      );
     }
   }
 
   /**
-   * Enforces driver validations before dispatch
+   * Ensures a driver is eligible for dispatch.
    */
-  public static validateDriverForDispatch(driver: Driver, tripId: string) {
-    if (driver.status === DriverStatus.ON_TRIP) {
-      throw new Error(`Driver ${driver.full_name} is currently assigned to another active trip.`);
-    }
-    if (driver.status === DriverStatus.SUSPENDED) {
-      throw new Error(`Driver ${driver.full_name} is currently suspended.`);
-    }
-    if (driver.status === DriverStatus.OFF_DUTY) {
-      throw new Error(`Driver ${driver.full_name} is currently off duty.`);
+  public static validateDriverForDispatch(
+    driver: Driver,
+    tripId: string,
+  ): void {
+    if (driver.status !== DriverStatus.AVAILABLE) {
+      const reason =
+        driver.status === DriverStatus.ON_TRIP
+          ? "currently assigned to another trip"
+          : driver.status === DriverStatus.SUSPENDED
+            ? "suspended"
+            : "off duty";
+
+      throw new Error(`Driver ${driver.full_name} is ${reason}.`);
     }
 
-    // Check licence expiry date
-    const todayStr = new Date().toISOString().split("T")[0];
-    if (driver.licence_expiry_date < todayStr) {
-      throw new Error(`Driver licence expired on ${driver.licence_expiry_date}.`);
+    const today = new Date().toISOString().slice(0, 10);
+    if (driver.licence_expiry_date < today) {
+      throw new Error(
+        `Driver licence expired on ${driver.licence_expiry_date}.`,
+      );
     }
 
-    // Check if double-assigned to another DISPATCHED trip
     const activeTrip = db.trips.find(
-      t => t.id !== tripId && t.driver_id === driver.id && t.status === TripStatus.DISPATCHED
+      (trip) =>
+        trip.id !== tripId &&
+        trip.driver_id === driver.id &&
+        trip.status === TripStatus.DISPATCHED,
     );
+
     if (activeTrip) {
-      throw new Error(`Driver ${driver.full_name} is already assigned to another active trip ${activeTrip.trip_code}.`);
+      throw new Error(
+        `Driver ${driver.full_name} is assigned to active trip ${activeTrip.trip_code}.`,
+      );
     }
   }
 
   /**
-   * Executes the dispatch transition
+   * Transitions a draft trip to DISPATCHED and locks its resources.
    */
-  public static dispatchTrip(tripId: string, dispatcher: { id: string; name: string }): Trip {
-    const trip = db.trips.find(t => t.id === tripId);
+  public static dispatchTrip(
+    tripId: string,
+    dispatcher: { id: string; name: string },
+  ): Trip {
+    const trip = db.trips.find(
+      (candidate) => candidate.id === tripId,
+    );
+
     if (!trip) {
-      throw new Error("Trip not found");
+      throw new Error("Trip not found.");
     }
+
     if (trip.status !== TripStatus.DRAFT) {
-      throw new Error(`Cannot dispatch a trip in ${trip.status} status.`);
+      throw new Error(
+        `Only draft trips can be dispatched. Current status: ${trip.status}.`,
+      );
     }
 
-    const vehicle = db.vehicles.find(v => v.id === trip.vehicle_id);
-    const driver = db.drivers.find(d => d.id === trip.driver_id);
+    const vehicle = db.vehicles.find(
+      (candidate) => candidate.id === trip.vehicle_id,
+    );
+    const driver = db.drivers.find(
+      (candidate) => candidate.id === trip.driver_id,
+    );
 
-    if (!vehicle) throw new Error("Assigned vehicle not found.");
-    if (!driver) throw new Error("Assigned driver not found.");
+    if (!vehicle) {
+      throw new Error("Assigned vehicle not found.");
+    }
 
-    // Validate rules
-    this.validateVehicleForDispatch(vehicle, tripId);
-    this.validateDriverForDispatch(driver, tripId);
+    if (!driver) {
+      throw new Error("Assigned driver not found.");
+    }
 
-    // Validate Cargo capacity
+    this.validateVehicleForDispatch(vehicle, trip.id);
+    this.validateDriverForDispatch(driver, trip.id);
+
     if (trip.cargo_weight > vehicle.maximum_load_capacity) {
-      throw new Error(`Cargo weight of ${trip.cargo_weight} kg exceeds vehicle capacity of ${vehicle.maximum_load_capacity} kg.`);
+      throw new Error(
+        `Cargo weight of ${trip.cargo_weight} kg exceeds vehicle capacity of ${vehicle.maximum_load_capacity} kg.`,
+      );
     }
 
-    // ----------------------------------------------------
-    // Begin State Transitions (Atomic Update)
-    // ----------------------------------------------------
-    const oldTripStatus = trip.status;
-    const oldVehicleStatus = vehicle.status;
-    const oldDriverStatus = driver.status;
+    const oldTrip = { ...trip };
+    const oldVehicle = { ...vehicle };
+    const oldDriver = { ...driver };
+    const now = new Date().toISOString();
+
+    trip.status = TripStatus.DISPATCHED;
+    trip.actual_start_time = now;
+    trip.updated_at = now;
+    vehicle.status = VehicleStatus.ON_TRIP;
+    vehicle.updated_at = now;
+    driver.status = DriverStatus.ON_TRIP;
+    driver.updated_at = now;
 
     try {
-      // 1. Update Trip
-      trip.status = TripStatus.DISPATCHED;
-      trip.actual_start_time = new Date().toISOString();
-      trip.updated_at = new Date().toISOString();
-
-      // 2. Update Vehicle
-      vehicle.status = VehicleStatus.ON_TRIP;
-      vehicle.updated_at = new Date().toISOString();
-
-      // 3. Update Driver
-      driver.status = DriverStatus.ON_TRIP;
-      driver.updated_at = new Date().toISOString();
-
-      // Save database
       db.save();
-
-      // 4. Log Activity
-      db.logActivity(
-        dispatcher.id,
-        dispatcher.name,
-        `Dispatched trip ${trip.trip_code}`,
-        "TRIP",
-        trip.id,
-        oldTripStatus,
-        TripStatus.DISPATCHED
-      );
-
-      // 5. Send Notification to Driver if linked
-      if (driver.user_id) {
-        db.notify(
-          driver.user_id,
-          "Trip Dispatched",
-          `You have been dispatched for trip ${trip.trip_code} from ${trip.source} to ${trip.destination}. Cargo: ${trip.cargo_description}.`,
-          NotificationType.TRIP_ASSIGNED
-        );
-      }
-
-      return trip;
-    } catch (err) {
-      // Rollback memory states if disk save fails (highly unlikely, but safe-practice)
-      trip.status = oldTripStatus;
-      trip.actual_start_time = undefined;
-      vehicle.status = oldVehicleStatus;
-      driver.status = oldDriverStatus;
-      db.save();
-      throw err;
+    } catch (error) {
+      Object.assign(trip, oldTrip);
+      Object.assign(vehicle, oldVehicle);
+      Object.assign(driver, oldDriver);
+      throw error;
     }
+
+    db.logActivity(
+      dispatcher.id,
+      dispatcher.name,
+      `Dispatched trip ${trip.trip_code}`,
+      "TRIP",
+      trip.id,
+      oldTrip.status,
+      TripStatus.DISPATCHED,
+    );
+
+    if (driver.user_id) {
+      db.notify(
+        driver.user_id,
+        "Trip Dispatched",
+        `You have been assigned to ${trip.trip_code} from ${trip.source} to ${trip.destination}.`,
+        NotificationType.TRIP_ASSIGNED,
+      );
+    }
+
+    return trip;
   }
 
   /**
-   * Executes the complete trip transition
+   * Completes a dispatched trip and releases its vehicle and driver.
    */
   public static completeTrip(
     tripId: string,
@@ -181,185 +211,255 @@ export class OperationsService {
       revenue?: number;
       notes?: string;
     },
-    operator: { id: string; name: string }
+    operator: { id: string; name: string },
   ): Trip {
-    const trip = db.trips.find(t => t.id === tripId);
+    const trip = db.trips.find(
+      (candidate) => candidate.id === tripId,
+    );
+
     if (!trip) {
-      throw new Error("Trip not found");
+      throw new Error("Trip not found.");
     }
+
     if (trip.status !== TripStatus.DISPATCHED) {
-      throw new Error("Only dispatched trips can be completed.");
+      throw new Error(
+        "Only dispatched trips can be completed.",
+      );
     }
 
-    const vehicle = db.vehicles.find(v => v.id === trip.vehicle_id);
-    const driver = db.drivers.find(d => d.id === trip.driver_id);
+    const vehicle = db.vehicles.find(
+      (candidate) => candidate.id === trip.vehicle_id,
+    );
+    const driver = db.drivers.find(
+      (candidate) => candidate.id === trip.driver_id,
+    );
 
-    if (!vehicle) throw new Error("Trip vehicle not found.");
-    if (!driver) throw new Error("Trip driver not found.");
-
-    // Validations
-    if (completionData.actual_distance < 0) {
-      throw new Error("Actual distance cannot be negative.");
-    }
-    if (completionData.fuel_consumed < 0) {
-      throw new Error("Fuel consumed cannot be negative.");
-    }
-    if (completionData.final_odometer < vehicle.odometer) {
-      throw new Error(`Final odometer (${completionData.final_odometer}) cannot be lower than the current odometer (${vehicle.odometer}).`);
+    if (!vehicle) {
+      throw new Error("Trip vehicle not found.");
     }
 
-    // Begin updates
-    const oldTripStatus = trip.status;
-    const oldVehicleStatus = vehicle.status;
-    const oldDriverStatus = driver.status;
-    const oldOdometer = vehicle.odometer;
+    if (!driver) {
+      throw new Error("Trip driver not found.");
+    }
+
+    if (vehicle.status !== VehicleStatus.ON_TRIP) {
+      throw new Error(
+        "The assigned vehicle is not in ON_TRIP status.",
+      );
+    }
+
+    if (driver.status !== DriverStatus.ON_TRIP) {
+      throw new Error(
+        "The assigned driver is not in ON_TRIP status.",
+      );
+    }
+
+    const {
+      actual_distance: actualDistance,
+      final_odometer: finalOdometer,
+      fuel_consumed: fuelConsumed,
+      revenue,
+      notes,
+    } = completionData;
+
+    if (!Number.isFinite(actualDistance) || actualDistance <= 0) {
+      throw new Error(
+        "Actual distance must be greater than zero.",
+      );
+    }
+
+    if (!Number.isFinite(fuelConsumed) || fuelConsumed < 0) {
+      throw new Error(
+        "Fuel consumed must be zero or greater.",
+      );
+    }
+
+    if (!Number.isFinite(finalOdometer)) {
+      throw new Error("Final odometer must be a valid number.");
+    }
+
+    if (finalOdometer < vehicle.odometer) {
+      throw new Error(
+        `Final odometer cannot be below the current reading of ${vehicle.odometer}.`,
+      );
+    }
+
+    if (finalOdometer < vehicle.odometer + actualDistance) {
+      throw new Error(
+        "Final odometer must be at least the current odometer plus the actual distance.",
+      );
+    }
+
+    if (
+      revenue !== undefined &&
+      (!Number.isFinite(revenue) || revenue < 0)
+    ) {
+      throw new Error("Revenue must be zero or greater.");
+    }
+
+    const oldTrip = { ...trip };
+    const oldVehicle = { ...vehicle };
+    const oldDriver = { ...driver };
+    const now = new Date().toISOString();
+    let newFuelLogId: string | null = null;
+
+    trip.status = TripStatus.COMPLETED;
+    trip.completed_at = now;
+    trip.actual_distance = actualDistance;
+    trip.final_odometer = finalOdometer;
+    trip.fuel_consumed = fuelConsumed;
+    trip.revenue = revenue ?? trip.revenue;
+    if (notes !== undefined) {
+      trip.notes = notes || undefined;
+    }
+    trip.updated_at = now;
+
+    vehicle.odometer = finalOdometer;
+    vehicle.status = VehicleStatus.AVAILABLE;
+    vehicle.updated_at = now;
+
+    driver.status = DriverStatus.AVAILABLE;
+    driver.updated_at = now;
+
+    if (fuelConsumed > 0) {
+      const pricePerLitre = 98;
+      newFuelLogId = db.generateId("fl");
+      db.fuel_logs.unshift({
+        id: newFuelLogId,
+        vehicle_id: vehicle.id,
+        trip_id: trip.id,
+        fuel_litres: fuelConsumed,
+        fuel_cost: fuelConsumed * pricePerLitre,
+        price_per_litre: pricePerLitre,
+        odometer_reading: finalOdometer,
+        fuel_date: now.slice(0, 10),
+        fuel_station: "Operational Hub Pump",
+        receipt_number: `AUTO-${trip.trip_code}`,
+        notes: "Automatically logged on trip completion",
+        created_by: operator.id,
+        created_at: now,
+        updated_at: now,
+      });
+    }
 
     try {
-      // 1. Update Trip
-      trip.status = TripStatus.COMPLETED;
-      trip.completed_at = new Date().toISOString();
-      trip.actual_distance = completionData.actual_distance;
-      trip.final_odometer = completionData.final_odometer;
-      trip.fuel_consumed = completionData.fuel_consumed;
-      if (completionData.revenue !== undefined && completionData.revenue >= 0) {
-        trip.revenue = completionData.revenue;
-      }
-      if (completionData.notes) {
-        trip.notes = completionData.notes;
-      }
-      trip.updated_at = new Date().toISOString();
-
-      // 2. Update Vehicle Odometer & Status
-      vehicle.odometer = completionData.final_odometer;
-      vehicle.status = VehicleStatus.AVAILABLE;
-      vehicle.updated_at = new Date().toISOString();
-
-      // 3. Update Driver Status
-      driver.status = DriverStatus.AVAILABLE;
-      driver.updated_at = new Date().toISOString();
-
-      // 4. Record Fuel Log if fuel consumed is logged and positive
-      if (completionData.fuel_consumed > 0) {
-        const estimatedFuelCost = completionData.fuel_consumed * 98; // assume average 98 per litre
-        const fLog = {
-          id: "fl_" + Math.random().toString(36).substr(2, 9),
-          vehicle_id: vehicle.id,
-          trip_id: trip.id,
-          fuel_litres: completionData.fuel_consumed,
-          fuel_cost: estimatedFuelCost,
-          price_per_litre: 98,
-          odometer_reading: completionData.final_odometer,
-          fuel_date: new Date().toISOString().split("T")[0],
-          fuel_station: "Operational Hub Pump",
-          receipt_number: "AUTO-" + trip.trip_code,
-          notes: "Automatically logged upon trip completion",
-          created_by: operator.id,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        };
-        db.fuel_logs.unshift(fLog);
-      }
-
-      // Save to file
       db.save();
+    } catch (error) {
+      Object.assign(trip, oldTrip);
+      Object.assign(vehicle, oldVehicle);
+      Object.assign(driver, oldDriver);
 
-      // 5. Activity Log
-      db.logActivity(
-        operator.id,
-        operator.name,
-        `Completed trip ${trip.trip_code}`,
-        "TRIP",
-        trip.id,
-        oldTripStatus,
-        TripStatus.COMPLETED
-      );
-
-      // Notify Driver and Fleet managers
-      if (driver.user_id) {
-        db.notify(
-          driver.user_id,
-          "Trip Completed Successfully",
-          `Trip ${trip.trip_code} from ${trip.source} to ${trip.destination} has been completed. Odometer recorded: ${completionData.final_odometer}.`,
-          NotificationType.TRIP_COMPLETED
+      if (newFuelLogId) {
+        const fuelIndex = db.fuel_logs.findIndex(
+          (fuelLog) => fuelLog.id === newFuelLogId,
         );
+        if (fuelIndex >= 0) {
+          db.fuel_logs.splice(fuelIndex, 1);
+        }
       }
 
-      return trip;
-    } catch (err) {
-      // rollback memory
-      trip.status = oldTripStatus;
-      trip.completed_at = undefined;
-      trip.actual_distance = undefined;
-      trip.final_odometer = undefined;
-      trip.fuel_consumed = undefined;
-      vehicle.odometer = oldOdometer;
-      vehicle.status = oldVehicleStatus;
-      driver.status = oldDriverStatus;
-      db.save();
-      throw err;
+      throw error;
     }
+
+    db.logActivity(
+      operator.id,
+      operator.name,
+      `Completed trip ${trip.trip_code}`,
+      "TRIP",
+      trip.id,
+      oldTrip.status,
+      TripStatus.COMPLETED,
+    );
+
+    if (driver.user_id) {
+      db.notify(
+        driver.user_id,
+        "Trip Completed",
+        `${trip.trip_code} was completed successfully. Final odometer: ${finalOdometer}.`,
+        NotificationType.TRIP_COMPLETED,
+      );
+    }
+
+    return trip;
   }
 
   /**
-   * Executes the cancel trip transition
+   * Cancels a draft or dispatched trip and releases active resources.
    */
-  public static cancelTrip(tripId: string, operator: { id: string; name: string }): Trip {
-    const trip = db.trips.find(t => t.id === tripId);
+  public static cancelTrip(
+    tripId: string,
+    operator: { id: string; name: string },
+  ): Trip {
+    const trip = db.trips.find(
+      (candidate) => candidate.id === tripId,
+    );
+
     if (!trip) {
-      throw new Error("Trip not found");
-    }
-    if (trip.status === TripStatus.COMPLETED) {
-      throw new Error("Completed trips cannot be cancelled.");
-    }
-    if (trip.status === TripStatus.CANCELLED) {
-      throw new Error("Trip is already cancelled.");
+      throw new Error("Trip not found.");
     }
 
-    const vehicle = db.vehicles.find(v => v.id === trip.vehicle_id);
-    const driver = db.drivers.find(d => d.id === trip.driver_id);
+    if (
+      ![
+        TripStatus.DRAFT,
+        TripStatus.DISPATCHED,
+      ].includes(trip.status)
+    ) {
+      throw new Error(
+        `A trip in ${trip.status} status cannot be cancelled.`,
+      );
+    }
 
-    const oldTripStatus = trip.status;
-    const oldVehicleStatus = vehicle?.status;
-    const oldDriverStatus = driver?.status;
+    const vehicle = db.vehicles.find(
+      (candidate) => candidate.id === trip.vehicle_id,
+    );
+    const driver = db.drivers.find(
+      (candidate) => candidate.id === trip.driver_id,
+    );
+    const oldTrip = { ...trip };
+    const oldVehicle = vehicle ? { ...vehicle } : null;
+    const oldDriver = driver ? { ...driver } : null;
+    const wasDispatched = trip.status === TripStatus.DISPATCHED;
+    const now = new Date().toISOString();
 
-    try {
-      // 1. Update Trip
-      trip.status = TripStatus.CANCELLED;
-      trip.updated_at = new Date().toISOString();
+    trip.status = TripStatus.CANCELLED;
+    trip.updated_at = now;
 
-      // 2. If it was dispatched, restore vehicle and driver to AVAILABLE
-      if (oldTripStatus === TripStatus.DISPATCHED) {
-        if (vehicle && vehicle.status === VehicleStatus.ON_TRIP) {
-          vehicle.status = VehicleStatus.AVAILABLE;
-          vehicle.updated_at = new Date().toISOString();
-        }
-        if (driver && driver.status === DriverStatus.ON_TRIP) {
-          driver.status = DriverStatus.AVAILABLE;
-          driver.updated_at = new Date().toISOString();
-        }
+    if (wasDispatched) {
+      if (vehicle?.status === VehicleStatus.ON_TRIP) {
+        vehicle.status = VehicleStatus.AVAILABLE;
+        vehicle.updated_at = now;
       }
 
-      db.save();
-
-      // 3. Activity Log
-      db.logActivity(
-        operator.id,
-        operator.name,
-        `Cancelled trip ${trip.trip_code}`,
-        "TRIP",
-        trip.id,
-        oldTripStatus,
-        TripStatus.CANCELLED
-      );
-
-      return trip;
-    } catch (err) {
-      trip.status = oldTripStatus;
-      if (vehicle && oldVehicleStatus) vehicle.status = oldVehicleStatus;
-      if (driver && oldDriverStatus) driver.status = oldDriverStatus;
-      db.save();
-      throw err;
+      if (driver?.status === DriverStatus.ON_TRIP) {
+        driver.status = DriverStatus.AVAILABLE;
+        driver.updated_at = now;
+      }
     }
+
+    try {
+      db.save();
+    } catch (error) {
+      Object.assign(trip, oldTrip);
+      if (vehicle && oldVehicle) {
+        Object.assign(vehicle, oldVehicle);
+      }
+      if (driver && oldDriver) {
+        Object.assign(driver, oldDriver);
+      }
+      throw error;
+    }
+
+    db.logActivity(
+      operator.id,
+      operator.name,
+      `Cancelled trip ${trip.trip_code}`,
+      "TRIP",
+      trip.id,
+      oldTrip.status,
+      TripStatus.CANCELLED,
+    );
+
+    return trip;
   }
 
   /**
