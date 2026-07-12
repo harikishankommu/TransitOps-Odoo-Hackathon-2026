@@ -2,6 +2,7 @@ import { Router } from "express";
 import { db } from "../database.js";
 import { Security, authenticateJWT, requireRole, AuthenticatedRequest } from "../utils/auth.js";
 import { OperationsService } from "../services/operations.js";
+import { syncAutomatedNotifications } from "../services/notificationService.js";
 import {
   User,
   UserRole,
@@ -6117,34 +6118,71 @@ apiRouter.delete(
 );
 
 
+
 // ============================================================================
 // 8. DASHBOARD ANALYTICS ENDPOINTS
-
 // ============================================================================
 
-apiRouter.get("/dashboard/summary", authenticateJWT, (req, res) => {
-  const totalVehicles = db.vehicles.length;
-  const nonRetiredVehicles = db.vehicles.filter(v => v.status !== VehicleStatus.RETIRED).length;
-  const availableVehicles = db.vehicles.filter(v => v.status === VehicleStatus.AVAILABLE).length;
-  const onTripVehicles = db.vehicles.filter(v => v.status === VehicleStatus.ON_TRIP).length;
-  const inMaintenanceVehicles = db.vehicles.filter(v => v.status === VehicleStatus.IN_SHOP).length;
+type DashboardPermissionSet = {
+  fleet: boolean;
+  drivers: boolean;
+  trips: boolean;
+  financials: boolean;
+};
 
-  const totalDrivers = db.drivers.length;
-  const availableDrivers = db.drivers.filter(d => d.status === DriverStatus.AVAILABLE).length;
-  const onTripDrivers = db.drivers.filter(d => d.status === DriverStatus.ON_TRIP).length;
+function getDashboardPermissions(
+  role: UserRole,
+): DashboardPermissionSet {
+  return {
+    fleet: [
+      UserRole.ADMIN,
+      UserRole.FLEET_MANAGER,
+      UserRole.DISPATCHER,
+    ].includes(role),
+    drivers: [
+      UserRole.ADMIN,
+      UserRole.DISPATCHER,
+      UserRole.SAFETY_OFFICER,
+    ].includes(role),
+    trips: [
+      UserRole.ADMIN,
+      UserRole.FLEET_MANAGER,
+      UserRole.DISPATCHER,
+      UserRole.DRIVER,
+    ].includes(role),
+    financials: [
+      UserRole.ADMIN,
+      UserRole.FLEET_MANAGER,
+      UserRole.FINANCIAL_ANALYST,
+    ].includes(role),
+  };
+}
 
-  const activeTrips = db.trips.filter(t => t.status === TripStatus.DISPATCHED).length;
-  const draftTrips = db.trips.filter(t => t.status === TripStatus.DRAFT).length;
+function isDateWithinRange(
+  value: string | undefined,
+  startTimestamp: number,
+  endTimestamp: number,
+): boolean {
+  if (!value) {
+    return false;
+  }
 
-  // Fleet utilization formula: Vehicles On Trip / Non-Retired Vehicles * 100
-  const utilization = nonRetiredVehicles > 0 ? (onTripVehicles / nonRetiredVehicles) * 100 : 0;
+  const timestamp = Date.parse(value);
 
-  // Financial math (all-time or monthly)
-  const totalFuelCost = db.fuel_logs.reduce((sum, f) => sum + f.fuel_cost, 0);
-  const totalMaintenanceCost = db.maintenance_logs.reduce((sum, m) => sum + (m.actual_cost || 0), 0);
-  const totalOtherExpenses = db.expenses
+  return (
+    Number.isFinite(timestamp) &&
+    timestamp >= startTimestamp &&
+    timestamp <= endTimestamp
+  );
+}
+
+function getOtherExpenseTotal(
+  predicate: (expense: Expense) => boolean = () => true,
+): number {
+  return db.expenses
     .filter(
       (expense) =>
+        predicate(expense) &&
         expense.expense_type !==
           ExpenseType.MAINTENANCE &&
         getExpenseSource(expense) !==
@@ -6154,378 +6192,1613 @@ apiRouter.get("/dashboard/summary", authenticateJWT, (req, res) => {
       (sum, expense) => sum + expense.amount,
       0,
     );
+}
 
-  const totalOperationalCost =
-    totalFuelCost +
-    totalMaintenanceCost +
-    totalOtherExpenses;
+function getActivityEntityTypesForRole(
+  role: UserRole,
+): Set<string> | null {
+  switch (role) {
+    case UserRole.ADMIN:
+      return null;
+    case UserRole.FLEET_MANAGER:
+      return new Set([
+        "VEHICLE",
+        "MAINTENANCE",
+        "FUEL",
+        "EXPENSE",
+        "TRIP",
+      ]);
+    case UserRole.DISPATCHER:
+      return new Set([
+        "TRIP",
+        "VEHICLE",
+        "DRIVER",
+      ]);
+    case UserRole.SAFETY_OFFICER:
+      return new Set(["DRIVER"]);
+    case UserRole.FINANCIAL_ANALYST:
+      return new Set([
+        "FUEL",
+        "EXPENSE",
+        "MAINTENANCE",
+        "TRIP",
+      ]);
+    default:
+      return new Set();
+  }
+}
 
-  res.json({
-    kpi: {
-      totalVehicles,
-      availableVehicles,
-      onTripVehicles,
-      inMaintenanceVehicles,
-      totalDrivers,
-      availableDrivers,
-      onTripDrivers,
-      activeTrips,
-      draftTrips,
-      fleetUtilization: Math.round(utilization),
-      totalFuelCost,
-      totalMaintenanceCost,
-      totalOperationalCost
-    }
-  });
-});
+apiRouter.get(
+  "/dashboard/overview",
+  authenticateJWT,
+  (req: AuthenticatedRequest, res) => {
+    syncAutomatedNotifications();
 
-apiRouter.get("/dashboard/vehicle-status", authenticateJWT, (req, res) => {
-  const statuses = [VehicleStatus.AVAILABLE, VehicleStatus.ON_TRIP, VehicleStatus.IN_SHOP, VehicleStatus.RETIRED];
-  const distribution = statuses.map(st => {
-    const count = db.vehicles.filter(v => v.status === st).length;
-    return { name: st.replace("_", " "), value: count };
-  });
-  res.json(distribution);
-});
+    const user = req.user!;
+    const permissions =
+      getDashboardPermissions(user.role);
+    const linkedDriver =
+      user.role === UserRole.DRIVER
+        ? db.drivers.find(
+            (driver) => driver.user_id === user.id,
+          )
+        : undefined;
+    const scopedTrips =
+      user.role === UserRole.DRIVER
+        ? db.trips.filter(
+            (trip) =>
+              linkedDriver &&
+              trip.driver_id === linkedDriver.id,
+          )
+        : db.trips;
 
-apiRouter.get("/dashboard/trip-status", authenticateJWT, (req, res) => {
-  const statuses = [TripStatus.DRAFT, TripStatus.DISPATCHED, TripStatus.COMPLETED, TripStatus.CANCELLED];
-  const distribution = statuses.map(st => {
-    const count = db.trips.filter(t => t.status === st).length;
-    return { name: st, value: count };
-  });
-  res.json(distribution);
-});
+    const totalVehicles = permissions.fleet
+      ? db.vehicles.length
+      : 0;
+    const nonRetiredVehicles = permissions.fleet
+      ? db.vehicles.filter(
+          (vehicle) =>
+            vehicle.status !== VehicleStatus.RETIRED,
+        ).length
+      : 0;
+    const availableVehicles = permissions.fleet
+      ? db.vehicles.filter(
+          (vehicle) =>
+            vehicle.status ===
+            VehicleStatus.AVAILABLE,
+        ).length
+      : 0;
+    const onTripVehicles = permissions.fleet
+      ? db.vehicles.filter(
+          (vehicle) =>
+            vehicle.status === VehicleStatus.ON_TRIP,
+        ).length
+      : 0;
+    const inMaintenanceVehicles = permissions.fleet
+      ? db.vehicles.filter(
+          (vehicle) =>
+            vehicle.status === VehicleStatus.IN_SHOP,
+        ).length
+      : 0;
 
-apiRouter.get("/dashboard/monthly-costs", authenticateJWT, (req, res) => {
-  // Return costs grouped by type for charts
-  const fuel = db.fuel_logs.reduce((sum, f) => sum + f.fuel_cost, 0);
-  const maintenance = db.maintenance_logs.reduce((sum, m) => sum + (m.actual_cost || 0), 0);
-  const others = db.expenses
-    .filter(
-      (expense) =>
-        expense.expense_type !==
-          ExpenseType.MAINTENANCE &&
-        getExpenseSource(expense) !==
-          "LEGACY_FUEL_MIRROR",
+    const totalDrivers = permissions.drivers
+      ? db.drivers.length
+      : linkedDriver
+        ? 1
+        : 0;
+    const availableDrivers = permissions.drivers
+      ? db.drivers.filter(
+          (driver) =>
+            driver.status === DriverStatus.AVAILABLE,
+        ).length
+      : linkedDriver?.status === DriverStatus.AVAILABLE
+        ? 1
+        : 0;
+    const onTripDrivers = permissions.drivers
+      ? db.drivers.filter(
+          (driver) =>
+            driver.status === DriverStatus.ON_TRIP,
+        ).length
+      : linkedDriver?.status === DriverStatus.ON_TRIP
+        ? 1
+        : 0;
+
+    const activeTrips = scopedTrips.filter(
+      (trip) =>
+        trip.status === TripStatus.DISPATCHED,
+    ).length;
+    const draftTrips = scopedTrips.filter(
+      (trip) => trip.status === TripStatus.DRAFT,
+    ).length;
+    const completedTrips = scopedTrips.filter(
+      (trip) =>
+        trip.status === TripStatus.COMPLETED,
+    ).length;
+    const cancelledTrips = scopedTrips.filter(
+      (trip) =>
+        trip.status === TripStatus.CANCELLED,
+    ).length;
+
+    const totalRevenue = permissions.financials
+      ? db.trips
+          .filter(
+            (trip) =>
+              trip.status === TripStatus.COMPLETED,
+          )
+          .reduce(
+            (sum, trip) => sum + trip.revenue,
+            0,
+          )
+      : 0;
+    const totalFuelCost = permissions.financials
+      ? db.fuel_logs.reduce(
+          (sum, log) => sum + log.fuel_cost,
+          0,
+        )
+      : 0;
+    const totalMaintenanceCost =
+      permissions.financials
+        ? db.maintenance_logs.reduce(
+            (sum, log) =>
+              sum + (log.actual_cost ?? 0),
+            0,
+          )
+        : 0;
+    const totalOtherExpenses =
+      permissions.financials
+        ? getOtherExpenseTotal()
+        : 0;
+    const totalOperationalCost =
+      totalFuelCost +
+      totalMaintenanceCost +
+      totalOtherExpenses;
+    const fleetUtilization =
+      nonRetiredVehicles > 0
+        ? Number(
+            (
+              (onTripVehicles /
+                nonRetiredVehicles) *
+              100
+            ).toFixed(1),
+          )
+        : 0;
+
+    const vehicleStatus = permissions.fleet
+      ? Object.values(VehicleStatus).map(
+          (status) => ({
+            name: status.replaceAll("_", " "),
+            value: db.vehicles.filter(
+              (vehicle) =>
+                vehicle.status === status,
+            ).length,
+          }),
+        )
+      : [];
+
+    const tripStatus = Object.values(
+      TripStatus,
+    ).map((status) => ({
+      name: status,
+      value: scopedTrips.filter(
+        (trip) => trip.status === status,
+      ).length,
+    }));
+
+    const now = new Date();
+    const monthlyFinancials = permissions.financials
+      ? Array.from({ length: 6 }, (_, index) => {
+          const monthStart = new Date(
+            Date.UTC(
+              now.getUTCFullYear(),
+              now.getUTCMonth() - (5 - index),
+              1,
+            ),
+          );
+          const monthEnd = new Date(
+            Date.UTC(
+              monthStart.getUTCFullYear(),
+              monthStart.getUTCMonth() + 1,
+              0,
+              23,
+              59,
+              59,
+              999,
+            ),
+          );
+          const startTimestamp =
+            monthStart.getTime();
+          const endTimestamp = monthEnd.getTime();
+
+          const revenue = db.trips
+            .filter(
+              (trip) =>
+                trip.status ===
+                  TripStatus.COMPLETED &&
+                isDateWithinRange(
+                  trip.completed_at ??
+                    trip.updated_at,
+                  startTimestamp,
+                  endTimestamp,
+                ),
+            )
+            .reduce(
+              (sum, trip) => sum + trip.revenue,
+              0,
+            );
+          const fuel = db.fuel_logs
+            .filter((log) =>
+              isDateWithinRange(
+                log.fuel_date,
+                startTimestamp,
+                endTimestamp,
+              ),
+            )
+            .reduce(
+              (sum, log) => sum + log.fuel_cost,
+              0,
+            );
+          const maintenance =
+            db.maintenance_logs
+              .filter((log) =>
+                isDateWithinRange(
+                  log.completed_date ??
+                    log.updated_at,
+                  startTimestamp,
+                  endTimestamp,
+                ),
+              )
+              .reduce(
+                (sum, log) =>
+                  sum + (log.actual_cost ?? 0),
+                0,
+              );
+          const other = getOtherExpenseTotal(
+            (expense) =>
+              isDateWithinRange(
+                expense.expense_date,
+                startTimestamp,
+                endTimestamp,
+              ),
+          );
+          const expenses =
+            fuel + maintenance + other;
+
+          return {
+            month: monthStart.toLocaleDateString(
+              "en-US",
+              {
+                month: "short",
+                year: "2-digit",
+                timeZone: "UTC",
+              },
+            ),
+            revenue,
+            expenses,
+            net: revenue - expenses,
+          };
+        })
+      : [];
+
+    const fuelEfficiency =
+      permissions.fleet ||
+      permissions.financials
+        ? db.vehicles
+            .map((vehicle) => {
+              const completed =
+                db.trips.filter(
+                  (trip) =>
+                    trip.vehicle_id ===
+                      vehicle.id &&
+                    trip.status ===
+                      TripStatus.COMPLETED,
+                );
+              const distance = completed.reduce(
+                (sum, trip) =>
+                  sum +
+                  (trip.actual_distance ?? 0),
+                0,
+              );
+              const litres = db.fuel_logs
+                .filter(
+                  (log) =>
+                    log.vehicle_id === vehicle.id,
+                )
+                .reduce(
+                  (sum, log) =>
+                    sum + log.fuel_litres,
+                  0,
+                );
+
+              return {
+                vehicle_name:
+                  vehicle.registration_number,
+                efficiency:
+                  litres > 0
+                    ? Number(
+                        (
+                          distance / litres
+                        ).toFixed(2),
+                      )
+                    : 0,
+              };
+            })
+            .filter(
+              (record) =>
+                record.efficiency > 0,
+            )
+            .sort(
+              (first, second) =>
+                second.efficiency -
+                first.efficiency,
+            )
+            .slice(0, 8)
+        : [];
+
+    const recentTrips = [...scopedTrips]
+      .sort((first, second) =>
+        second.updated_at.localeCompare(
+          first.updated_at,
+        ),
+      )
+      .slice(0, 6)
+      .map((trip) => {
+        const vehicle = db.vehicles.find(
+          (candidate) =>
+            candidate.id === trip.vehicle_id,
+        );
+        const driver = db.drivers.find(
+          (candidate) =>
+            candidate.id === trip.driver_id,
+        );
+
+        return {
+          id: trip.id,
+          trip_code: trip.trip_code,
+          route: `${trip.source} → ${trip.destination}`,
+          status: trip.status,
+          vehicle:
+            vehicle?.registration_number ??
+            "Unknown",
+          driver:
+            driver?.full_name ?? "Unknown",
+          updated_at: trip.updated_at,
+        };
+      });
+
+    const recentMaintenance = permissions.fleet
+      ? [...db.maintenance_logs]
+          .sort((first, second) =>
+            second.updated_at.localeCompare(
+              first.updated_at,
+            ),
+          )
+          .slice(0, 5)
+          .map((log) => {
+            const vehicle = db.vehicles.find(
+              (candidate) =>
+                candidate.id === log.vehicle_id,
+            );
+
+            return {
+              id: log.id,
+              vehicle:
+                vehicle?.registration_number ??
+                "Unknown",
+              maintenance_type:
+                log.maintenance_type,
+              status: log.status,
+              expected_completion_date:
+                log.expected_completion_date,
+            };
+          })
+      : [];
+
+    const today = new Date()
+      .toISOString()
+      .slice(0, 10);
+    const licenceLimit = new Date(
+      Date.now() + 30 * 24 * 60 * 60 * 1000,
     )
-    .reduce(
-      (sum, expense) => sum + expense.amount,
-      0,
-    );
+      .toISOString()
+      .slice(0, 10);
+    const licenceAlerts = permissions.drivers
+      ? db.drivers
+          .filter(
+            (driver) =>
+              driver.licence_expiry_date <=
+              licenceLimit,
+          )
+          .map((driver) => ({
+            driver_id: driver.id,
+            driver_name: driver.full_name,
+            licence: driver.licence_number,
+            expiry:
+              driver.licence_expiry_date,
+            status:
+              driver.licence_expiry_date <
+              today
+                ? "EXPIRED"
+                : "EXPIRING_SOON",
+          }))
+          .sort((first, second) =>
+            first.expiry.localeCompare(
+              second.expiry,
+            ),
+          )
+      : [];
 
-  res.json([
-    { name: "Fuel Logs", cost: fuel },
-    { name: "Maintenance", cost: maintenance },
-    { name: "Other Expenses", cost: others }
-  ]);
-});
+    const activityTypes =
+      getActivityEntityTypesForRole(user.role);
+    const recentActivity =
+      user.role === UserRole.DRIVER
+        ? db.activity_logs
+            .filter(
+              (log) => log.user_id === user.id,
+            )
+            .slice(0, 8)
+        : db.activity_logs
+            .filter(
+              (log) =>
+                activityTypes === null ||
+                activityTypes.has(
+                  log.entity_type,
+                ),
+            )
+            .slice(0, 8);
 
-apiRouter.get("/dashboard/fuel-efficiency", authenticateJWT, (req, res) => {
-  // Fuel Efficiency: Distance / fuel_consumed
-  const vehiclesWithTrips = db.vehicles.map(v => {
-    const vTrips = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
-    let totalDist = 0;
-    let totalFuel = 0;
+    const notifications =
+      db.notifications
+        .filter(
+          (notification) =>
+            !notification.is_read &&
+            canAccessNotification(
+              user.id,
+              notification,
+            ),
+        )
+        .slice(0, 6);
 
-    vTrips.forEach(t => {
-      totalDist += t.actual_distance || 0;
-      totalFuel += t.fuel_consumed || 0;
+    return res.json({
+      generated_at: new Date().toISOString(),
+      role: user.role,
+      permissions,
+      kpi: {
+        totalVehicles,
+        availableVehicles,
+        onTripVehicles,
+        inMaintenanceVehicles,
+        totalDrivers,
+        availableDrivers,
+        onTripDrivers,
+        activeTrips,
+        draftTrips,
+        completedTrips,
+        cancelledTrips,
+        fleetUtilization,
+        totalRevenue,
+        totalFuelCost,
+        totalMaintenanceCost,
+        totalOtherExpenses,
+        totalOperationalCost,
+        netBalance:
+          totalRevenue -
+          totalOperationalCost,
+        unreadNotifications:
+          notifications.length,
+        personalDistance:
+          user.role === UserRole.DRIVER
+            ? scopedTrips
+                .filter(
+                  (trip) =>
+                    trip.status ===
+                    TripStatus.COMPLETED,
+                )
+                .reduce(
+                  (sum, trip) =>
+                    sum +
+                    (trip.actual_distance ?? 0),
+                  0,
+                )
+            : 0,
+        averageSafetyScore:
+          permissions.drivers &&
+          db.drivers.length > 0
+            ? Number(
+                (
+                  db.drivers.reduce(
+                    (sum, driver) =>
+                      sum +
+                      driver.safety_score,
+                    0,
+                  ) / db.drivers.length
+                ).toFixed(1),
+              )
+            : linkedDriver?.safety_score ?? 0,
+      },
+      vehicle_status: vehicleStatus,
+      trip_status: tripStatus,
+      monthly_financials: monthlyFinancials,
+      fuel_efficiency: fuelEfficiency,
+      recent_trips: recentTrips,
+      recent_maintenance:
+        recentMaintenance,
+      licence_alerts: licenceAlerts,
+      recent_activity: recentActivity,
+      notifications,
     });
-
-    const efficiency = totalFuel > 0 ? Number((totalDist / totalFuel).toFixed(2)) : 0;
-    return {
-      vehicle_name: `${v.vehicle_name} (${v.registration_number})`,
-      efficiency
-    };
-  }).filter(item => item.efficiency > 0);
-
-  res.json(vehiclesWithTrips);
-});
-
-apiRouter.get("/dashboard/recent-activity", authenticateJWT, (req, res) => {
-  res.json(db.activity_logs.slice(0, 10)); // Top 10 activities
-});
-
-apiRouter.get("/dashboard/licence-alerts", authenticateJWT, (req, res) => {
-  const today = new Date();
-  const limit30 = new Date(Date.now() + 30 * 86400000);
-  const todayStr = today.toISOString().split("T")[0];
-  const limitStr = limit30.toISOString().split("T")[0];
-
-  const expired = db.drivers.filter(d => d.licence_expiry_date < todayStr).map(d => ({
-    driver_id: d.id,
-    driver_name: d.full_name,
-    licence: d.licence_number,
-    expiry: d.licence_expiry_date,
-    status: "EXPIRED"
-  }));
-
-  const expiring = db.drivers.filter(d => d.licence_expiry_date >= todayStr && d.licence_expiry_date <= limitStr).map(d => ({
-    driver_id: d.id,
-    driver_name: d.full_name,
-    licence: d.licence_number,
-    expiry: d.licence_expiry_date,
-    status: "EXPIRING_SOON"
-  }));
-
-  res.json({
-    expired,
-    expiring_soon: expiring
-  });
-});
-
+  },
+);
 
 // ============================================================================
 // 9. REPORTS MODULE ENDPOINTS
 // ============================================================================
 
-apiRouter.get(
-  "/reports/vehicle-performance",
-  authenticateJWT,
-  requireRole(REPORT_ROLES),
-  (req, res) => {
-  const list = db.vehicles.map(v => {
-    const vTrips = db.trips.filter(t => t.vehicle_id === v.id);
-    const completed = vTrips.filter(t => t.status === TripStatus.COMPLETED);
-    const distance = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
-    const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
+type AnalyticsReportType =
+  | "VEHICLE"
+  | "FINANCIAL"
+  | "FUEL"
+  | "MAINTENANCE"
+  | "DRIVER";
 
-    const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id).reduce((sum, f) => sum + f.fuel_cost, 0);
-    const maintenance = db.maintenance_logs.filter(m => m.vehicle_id === v.id).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
-    const totalCost = fuel + maintenance;
+type ReportCellFormat =
+  | "text"
+  | "number"
+  | "currency"
+  | "percent";
 
+interface ReportColumn {
+  key: string;
+  label: string;
+  format: ReportCellFormat;
+}
+
+interface ReportSummaryItem {
+  label: string;
+  value: number;
+  format: Exclude<ReportCellFormat, "text">;
+}
+
+interface AnalyticsReport {
+  type: AnalyticsReportType;
+  columns: ReportColumn[];
+  rows: Array<Record<string, string | number>>;
+  summary: ReportSummaryItem[];
+}
+
+const REPORT_TYPES_BY_ROLE: Record<
+  UserRole,
+  readonly AnalyticsReportType[]
+> = {
+  [UserRole.ADMIN]: [
+    "VEHICLE",
+    "FINANCIAL",
+    "FUEL",
+    "MAINTENANCE",
+    "DRIVER",
+  ],
+  [UserRole.FLEET_MANAGER]: [
+    "VEHICLE",
+    "FINANCIAL",
+    "FUEL",
+    "MAINTENANCE",
+  ],
+  [UserRole.DISPATCHER]: [],
+  [UserRole.SAFETY_OFFICER]: ["DRIVER"],
+  [UserRole.FINANCIAL_ANALYST]: [
+    "FINANCIAL",
+    "FUEL",
+    "VEHICLE",
+  ],
+  [UserRole.DRIVER]: [],
+};
+
+function isAnalyticsReportType(
+  value: string,
+): value is AnalyticsReportType {
+  return [
+    "VEHICLE",
+    "FINANCIAL",
+    "FUEL",
+    "MAINTENANCE",
+    "DRIVER",
+  ].includes(value);
+}
+
+function getReportDateRange(
+  startDate: string,
+  endDate: string,
+):
+  | {
+      startTimestamp: number;
+      endTimestamp: number;
+    }
+  | { error: string } {
+  if (
+    !isIsoDate(startDate) ||
+    !isIsoDate(endDate)
+  ) {
     return {
-      vehicle_id: v.id,
-      registration_number: v.registration_number,
-      vehicle_name: v.vehicle_name,
-      total_trips: vTrips.length,
-      completed_trips: completed.length,
-      total_distance: distance,
-      total_revenue: revenue,
-      operational_cost: totalCost,
-      net_profit: revenue - totalCost
+      error:
+        "Start date and end date must be valid ISO dates.",
     };
-  });
-  res.json(list);
-});
+  }
 
-apiRouter.get(
-  "/reports/fuel-efficiency",
-  authenticateJWT,
-  requireRole(REPORT_ROLES),
-  (req, res) => {
-  const list = db.vehicles.map(v => {
-    const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
-    const dist = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
-    const fuel = completed.reduce((sum, t) => sum + (t.fuel_consumed || 0), 0);
+  const startTimestamp = Date.parse(
+    `${startDate}T00:00:00.000Z`,
+  );
+  const endTimestamp = Date.parse(
+    `${endDate}T23:59:59.999Z`,
+  );
 
-    const efficiency = fuel > 0 ? Number((dist / fuel).toFixed(2)) : 0;
+  if (startTimestamp > endTimestamp) {
     return {
-      registration_number: v.registration_number,
-      vehicle_name: v.vehicle_name,
-      completed_trips: completed.length,
-      total_distance: dist,
-      total_fuel_consumed: fuel,
-      efficiency_km_per_litre: efficiency
+      error:
+        "Start date cannot be after end date.",
     };
-  });
-  res.json(list);
-});
+  }
 
-apiRouter.get(
-  "/reports/vehicle-roi",
-  authenticateJWT,
-  requireRole(REPORT_ROLES),
-  (req, res) => {
-  // ROI Formula: (Revenue - Operational Cost) / Acquisition Cost
-  const list = db.vehicles.map(v => {
-    const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
-    const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
-
-    const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id).reduce((sum, f) => sum + f.fuel_cost, 0);
-    const maintenance = db.maintenance_logs.filter(m => m.vehicle_id === v.id).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
-    const expenses = db.expenses.filter(e => e.vehicle_id === v.id).reduce((sum, e) => sum + e.amount, 0);
-    const totalCost = fuel + maintenance + expenses;
-
-    const netProfit = revenue - totalCost;
-    const roi = v.acquisition_cost > 0 ? (netProfit / v.acquisition_cost) * 100 : 0;
-
-    return {
-      registration_number: v.registration_number,
-      vehicle_name: v.vehicle_name,
-      acquisition_cost: v.acquisition_cost,
-      total_revenue: revenue,
-      operational_cost: totalCost,
-      net_profit: netProfit,
-      roi_percentage: Number(roi.toFixed(2))
-    };
-  });
-  res.json(list);
-});
-
-apiRouter.get(
-  "/reports/summary",
-  authenticateJWT,
-  requireRole(REPORT_ROLES),
-  (req, res) => {
-  const { start_date, end_date, type } = req.query;
-  const start = start_date ? new Date(start_date as string) : null;
-  const end = end_date ? new Date(end_date as string) : null;
-
-  if (start) start.setHours(0, 0, 0, 0);
-  if (end) end.setHours(23, 59, 59, 999);
-
-  const isWithinRange = (dateStr?: string) => {
-    if (!dateStr) return false;
-    const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return false;
-    if (start && d < start) return false;
-    if (end && d > end) return false;
-    return true;
+  return {
+    startTimestamp,
+    endTimestamp,
   };
+}
 
-  if (type === "ROI") {
-    const list = db.vehicles.map(v => {
-      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED && isWithinRange(t.completed_at || t.created_at));
-      const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
+function buildAnalyticsReport(
+  type: AnalyticsReportType,
+  startTimestamp: number,
+  endTimestamp: number,
+  vehicleId: string,
+  driverId: string,
+): AnalyticsReport {
+  const vehicleMatches = (
+    candidateVehicleId: string | undefined,
+  ): boolean =>
+    !vehicleId ||
+    candidateVehicleId === vehicleId;
+  const driverMatches = (
+    candidateDriverId: string | undefined,
+  ): boolean =>
+    !driverId ||
+    candidateDriverId === driverId;
 
-      const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id && isWithinRange(f.fuel_date || f.created_at)).reduce((sum, f) => sum + f.fuel_cost, 0);
-      const maintenance = db.maintenance_logs.filter(m => m.vehicle_id === v.id && isWithinRange(m.completed_date || m.start_date || m.created_at)).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
-      const totalCost = fuel + maintenance;
+  const completedTrips = db.trips.filter(
+    (trip) =>
+      trip.status === TripStatus.COMPLETED &&
+      vehicleMatches(trip.vehicle_id) &&
+      driverMatches(trip.driver_id) &&
+      isDateWithinRange(
+        trip.completed_at ?? trip.updated_at,
+        startTimestamp,
+        endTimestamp,
+      ),
+  );
+  const fuelLogs = db.fuel_logs.filter(
+    (log) =>
+      vehicleMatches(log.vehicle_id) &&
+      isDateWithinRange(
+        log.fuel_date,
+        startTimestamp,
+        endTimestamp,
+      ),
+  );
+  const maintenanceLogs =
+    db.maintenance_logs.filter(
+      (log) =>
+        vehicleMatches(log.vehicle_id) &&
+        isDateWithinRange(
+          log.completed_date ??
+            log.start_date ??
+            log.created_at,
+          startTimestamp,
+          endTimestamp,
+        ),
+    );
+  const expenses = db.expenses.filter(
+    (expense) =>
+      vehicleMatches(expense.vehicle_id) &&
+      isDateWithinRange(
+        expense.expense_date,
+        startTimestamp,
+        endTimestamp,
+      ),
+  );
 
-      const netProfit = revenue - totalCost;
-      const roi = v.acquisition_cost > 0 ? (netProfit / v.acquisition_cost) * 100 : 0;
+  if (type === "FINANCIAL") {
+    const monthKeys = new Set<string>();
+
+    for (
+      let cursor = new Date(startTimestamp);
+      cursor.getTime() <= endTimestamp;
+      cursor = new Date(
+        Date.UTC(
+          cursor.getUTCFullYear(),
+          cursor.getUTCMonth() + 1,
+          1,
+        ),
+      )
+    ) {
+      monthKeys.add(
+        `${cursor.getUTCFullYear()}-${String(
+          cursor.getUTCMonth() + 1,
+        ).padStart(2, "0")}`,
+      );
+    }
+
+    const rows = [...monthKeys].map(
+      (monthKey) => {
+        const inMonth = (
+          value: string | undefined,
+        ): boolean =>
+          Boolean(
+            value &&
+              value.slice(0, 7) === monthKey,
+          );
+        const revenue = completedTrips
+          .filter((trip) =>
+            inMonth(
+              trip.completed_at ??
+                trip.updated_at,
+            ),
+          )
+          .reduce(
+            (sum, trip) => sum + trip.revenue,
+            0,
+          );
+        const fuelCost = fuelLogs
+          .filter((log) =>
+            inMonth(log.fuel_date),
+          )
+          .reduce(
+            (sum, log) =>
+              sum + log.fuel_cost,
+            0,
+          );
+        const maintenanceCost =
+          maintenanceLogs
+            .filter((log) =>
+              inMonth(
+                log.completed_date ??
+                  log.updated_at,
+              ),
+            )
+            .reduce(
+              (sum, log) =>
+                sum +
+                (log.actual_cost ?? 0),
+              0,
+            );
+        const otherExpenses = expenses
+          .filter(
+            (expense) =>
+              inMonth(expense.expense_date) &&
+              expense.expense_type !==
+                ExpenseType.MAINTENANCE &&
+              getExpenseSource(expense) !==
+                "LEGACY_FUEL_MIRROR",
+          )
+          .reduce(
+            (sum, expense) =>
+              sum + expense.amount,
+            0,
+          );
+        const totalExpenses =
+          fuelCost +
+          maintenanceCost +
+          otherExpenses;
+
+        return {
+          month: monthKey,
+          revenue,
+          fuel_cost: fuelCost,
+          maintenance_cost:
+            maintenanceCost,
+          other_expenses: otherExpenses,
+          total_expenses: totalExpenses,
+          net_balance:
+            revenue - totalExpenses,
+        };
+      },
+    );
+
+    return {
+      type,
+      columns: [
+        {
+          key: "month",
+          label: "Month",
+          format: "text",
+        },
+        {
+          key: "revenue",
+          label: "Revenue",
+          format: "currency",
+        },
+        {
+          key: "fuel_cost",
+          label: "Fuel Cost",
+          format: "currency",
+        },
+        {
+          key: "maintenance_cost",
+          label: "Maintenance",
+          format: "currency",
+        },
+        {
+          key: "other_expenses",
+          label: "Other Expenses",
+          format: "currency",
+        },
+        {
+          key: "total_expenses",
+          label: "Total Expenses",
+          format: "currency",
+        },
+        {
+          key: "net_balance",
+          label: "Net Balance",
+          format: "currency",
+        },
+      ],
+      rows,
+      summary: [
+        {
+          label: "Revenue",
+          value: rows.reduce(
+            (sum, row) =>
+              sum + Number(row.revenue),
+            0,
+          ),
+          format: "currency",
+        },
+        {
+          label: "Operating Cost",
+          value: rows.reduce(
+            (sum, row) =>
+              sum +
+              Number(row.total_expenses),
+            0,
+          ),
+          format: "currency",
+        },
+        {
+          label: "Net Balance",
+          value: rows.reduce(
+            (sum, row) =>
+              sum +
+              Number(row.net_balance),
+            0,
+          ),
+          format: "currency",
+        },
+      ],
+    };
+  }
+
+  if (type === "FUEL") {
+    const rows = db.vehicles
+      .filter(
+        (vehicle) =>
+          !vehicleId ||
+          vehicle.id === vehicleId,
+      )
+      .map((vehicle) => {
+        const vehicleTrips =
+          completedTrips.filter(
+            (trip) =>
+              trip.vehicle_id === vehicle.id,
+          );
+        const vehicleFuel = fuelLogs.filter(
+          (log) =>
+            log.vehicle_id === vehicle.id,
+        );
+        const distance = vehicleTrips.reduce(
+          (sum, trip) =>
+            sum +
+            (trip.actual_distance ?? 0),
+          0,
+        );
+        const litres = vehicleFuel.reduce(
+          (sum, log) =>
+            sum + log.fuel_litres,
+          0,
+        );
+        const cost = vehicleFuel.reduce(
+          (sum, log) =>
+            sum + log.fuel_cost,
+          0,
+        );
+
+        return {
+          registration:
+            vehicle.registration_number,
+          vehicle: vehicle.vehicle_name,
+          completed_trips:
+            vehicleTrips.length,
+          distance,
+          litres,
+          fuel_cost: cost,
+          efficiency:
+            litres > 0
+              ? Number(
+                  (
+                    distance / litres
+                  ).toFixed(2),
+                )
+              : 0,
+          average_price:
+            litres > 0
+              ? Number(
+                  (cost / litres).toFixed(2),
+                )
+              : 0,
+        };
+      });
+
+    const totalDistance = rows.reduce(
+      (sum, row) =>
+        sum + Number(row.distance),
+      0,
+    );
+    const totalLitres = rows.reduce(
+      (sum, row) =>
+        sum + Number(row.litres),
+      0,
+    );
+
+    return {
+      type,
+      columns: [
+        {
+          key: "registration",
+          label: "Registration",
+          format: "text",
+        },
+        {
+          key: "vehicle",
+          label: "Vehicle",
+          format: "text",
+        },
+        {
+          key: "completed_trips",
+          label: "Completed Trips",
+          format: "number",
+        },
+        {
+          key: "distance",
+          label: "Distance (km)",
+          format: "number",
+        },
+        {
+          key: "litres",
+          label: "Fuel (L)",
+          format: "number",
+        },
+        {
+          key: "fuel_cost",
+          label: "Fuel Cost",
+          format: "currency",
+        },
+        {
+          key: "efficiency",
+          label: "Efficiency (km/L)",
+          format: "number",
+        },
+        {
+          key: "average_price",
+          label: "Average Price/L",
+          format: "currency",
+        },
+      ],
+      rows,
+      summary: [
+        {
+          label: "Distance",
+          value: totalDistance,
+          format: "number",
+        },
+        {
+          label: "Fuel Consumed",
+          value: totalLitres,
+          format: "number",
+        },
+        {
+          label: "Fleet Efficiency",
+          value:
+            totalLitres > 0
+              ? Number(
+                  (
+                    totalDistance /
+                    totalLitres
+                  ).toFixed(2),
+                )
+              : 0,
+          format: "number",
+        },
+      ],
+    };
+  }
+
+  if (type === "MAINTENANCE") {
+    const rows = db.vehicles
+      .filter(
+        (vehicle) =>
+          !vehicleId ||
+          vehicle.id === vehicleId,
+      )
+      .map((vehicle) => {
+        const logs = maintenanceLogs.filter(
+          (log) =>
+            log.vehicle_id === vehicle.id,
+        );
+        const completed = logs.filter(
+          (log) =>
+            log.status ===
+            MaintenanceStatus.COMPLETED,
+        );
+        const active = logs.filter((log) =>
+          [
+            MaintenanceStatus.OPEN,
+            MaintenanceStatus.IN_PROGRESS,
+          ].includes(log.status),
+        );
+        const actualCost = logs.reduce(
+          (sum, log) =>
+            sum +
+            (log.actual_cost ?? 0),
+          0,
+        );
+
+        return {
+          registration:
+            vehicle.registration_number,
+          vehicle: vehicle.vehicle_name,
+          maintenance_records: logs.length,
+          completed_records:
+            completed.length,
+          active_records: active.length,
+          estimated_cost: logs.reduce(
+            (sum, log) =>
+              sum + log.estimated_cost,
+            0,
+          ),
+          actual_cost: actualCost,
+          average_cost:
+            completed.length > 0
+              ? Number(
+                  (
+                    actualCost /
+                    completed.length
+                  ).toFixed(2),
+                )
+              : 0,
+        };
+      });
+
+    return {
+      type,
+      columns: [
+        {
+          key: "registration",
+          label: "Registration",
+          format: "text",
+        },
+        {
+          key: "vehicle",
+          label: "Vehicle",
+          format: "text",
+        },
+        {
+          key: "maintenance_records",
+          label: "Records",
+          format: "number",
+        },
+        {
+          key: "completed_records",
+          label: "Completed",
+          format: "number",
+        },
+        {
+          key: "active_records",
+          label: "Active",
+          format: "number",
+        },
+        {
+          key: "estimated_cost",
+          label: "Estimated Cost",
+          format: "currency",
+        },
+        {
+          key: "actual_cost",
+          label: "Actual Cost",
+          format: "currency",
+        },
+        {
+          key: "average_cost",
+          label: "Average Cost",
+          format: "currency",
+        },
+      ],
+      rows,
+      summary: [
+        {
+          label: "Maintenance Records",
+          value: rows.reduce(
+            (sum, row) =>
+              sum +
+              Number(
+                row.maintenance_records,
+              ),
+            0,
+          ),
+          format: "number",
+        },
+        {
+          label: "Active Orders",
+          value: rows.reduce(
+            (sum, row) =>
+              sum +
+              Number(row.active_records),
+            0,
+          ),
+          format: "number",
+        },
+        {
+          label: "Actual Cost",
+          value: rows.reduce(
+            (sum, row) =>
+              sum +
+              Number(row.actual_cost),
+            0,
+          ),
+          format: "currency",
+        },
+      ],
+    };
+  }
+
+  if (type === "DRIVER") {
+    const rows = db.drivers
+      .filter(
+        (driver) =>
+          !driverId ||
+          driver.id === driverId,
+      )
+      .map((driver) => {
+        const trips = db.trips.filter(
+          (trip) =>
+            trip.driver_id === driver.id &&
+            (!vehicleId ||
+              trip.vehicle_id === vehicleId) &&
+            isDateWithinRange(
+              trip.completed_at ??
+                trip.updated_at,
+              startTimestamp,
+              endTimestamp,
+            ),
+        );
+        const completed = trips.filter(
+          (trip) =>
+            trip.status ===
+            TripStatus.COMPLETED,
+        );
+        const cancelled = trips.filter(
+          (trip) =>
+            trip.status ===
+            TripStatus.CANCELLED,
+        );
+
+        return {
+          driver: driver.full_name,
+          licence: driver.licence_number,
+          safety_score:
+            driver.safety_score,
+          total_trips: trips.length,
+          completed_trips:
+            completed.length,
+          cancelled_trips:
+            cancelled.length,
+          distance: completed.reduce(
+            (sum, trip) =>
+              sum +
+              (trip.actual_distance ?? 0),
+            0,
+          ),
+          revenue: completed.reduce(
+            (sum, trip) =>
+              sum + trip.revenue,
+            0,
+          ),
+          completion_rate:
+            trips.length > 0
+              ? Number(
+                  (
+                    (completed.length /
+                      trips.length) *
+                    100
+                  ).toFixed(1),
+                )
+              : 0,
+        };
+      });
+
+    return {
+      type,
+      columns: [
+        {
+          key: "driver",
+          label: "Driver",
+          format: "text",
+        },
+        {
+          key: "licence",
+          label: "Licence",
+          format: "text",
+        },
+        {
+          key: "safety_score",
+          label: "Safety Score",
+          format: "number",
+        },
+        {
+          key: "total_trips",
+          label: "Trips",
+          format: "number",
+        },
+        {
+          key: "completed_trips",
+          label: "Completed",
+          format: "number",
+        },
+        {
+          key: "cancelled_trips",
+          label: "Cancelled",
+          format: "number",
+        },
+        {
+          key: "distance",
+          label: "Distance (km)",
+          format: "number",
+        },
+        {
+          key: "revenue",
+          label: "Revenue",
+          format: "currency",
+        },
+        {
+          key: "completion_rate",
+          label: "Completion Rate",
+          format: "percent",
+        },
+      ],
+      rows,
+      summary: [
+        {
+          label: "Drivers",
+          value: rows.length,
+          format: "number",
+        },
+        {
+          label: "Completed Trips",
+          value: rows.reduce(
+            (sum, row) =>
+              sum +
+              Number(row.completed_trips),
+            0,
+          ),
+          format: "number",
+        },
+        {
+          label: "Average Safety Score",
+          value:
+            rows.length > 0
+              ? Number(
+                  (
+                    rows.reduce(
+                      (sum, row) =>
+                        sum +
+                        Number(
+                          row.safety_score,
+                        ),
+                      0,
+                    ) / rows.length
+                  ).toFixed(1),
+                )
+              : 0,
+          format: "number",
+        },
+      ],
+    };
+  }
+
+  const rows = db.vehicles
+    .filter(
+      (vehicle) =>
+        !vehicleId ||
+        vehicle.id === vehicleId,
+    )
+    .map((vehicle) => {
+      const vehicleTrips =
+        completedTrips.filter(
+          (trip) =>
+            trip.vehicle_id === vehicle.id,
+        );
+      const vehicleFuel = fuelLogs.filter(
+        (log) =>
+          log.vehicle_id === vehicle.id,
+      );
+      const vehicleMaintenance =
+        maintenanceLogs.filter(
+          (log) =>
+            log.vehicle_id === vehicle.id,
+        );
+      const vehicleExpenses = expenses.filter(
+        (expense) =>
+          expense.vehicle_id === vehicle.id &&
+          expense.expense_type !==
+            ExpenseType.MAINTENANCE &&
+          getExpenseSource(expense) !==
+            "LEGACY_FUEL_MIRROR",
+      );
+      const revenue = vehicleTrips.reduce(
+        (sum, trip) =>
+          sum + trip.revenue,
+        0,
+      );
+      const distance = vehicleTrips.reduce(
+        (sum, trip) =>
+          sum +
+          (trip.actual_distance ?? 0),
+        0,
+      );
+      const fuelCost = vehicleFuel.reduce(
+        (sum, log) =>
+          sum + log.fuel_cost,
+        0,
+      );
+      const maintenanceCost =
+        vehicleMaintenance.reduce(
+          (sum, log) =>
+            sum +
+            (log.actual_cost ?? 0),
+          0,
+        );
+      const otherCost =
+        vehicleExpenses.reduce(
+          (sum, expense) =>
+            sum + expense.amount,
+          0,
+        );
+      const operatingCost =
+        fuelCost +
+        maintenanceCost +
+        otherCost;
+      const netProfit =
+        revenue - operatingCost;
 
       return {
-        vehicle_id: v.id,
-        registration_number: v.registration_number,
-        vehicle_name: v.vehicle_name,
-        acquisition_cost: v.acquisition_cost || 0,
-        revenue: revenue,
-        fuel_cost: fuel,
-        maintenance_cost: maintenance,
+        registration:
+          vehicle.registration_number,
+        vehicle: vehicle.vehicle_name,
+        completed_trips:
+          vehicleTrips.length,
+        distance,
+        revenue,
+        fuel_cost: fuelCost,
+        maintenance_cost:
+          maintenanceCost,
+        other_cost: otherCost,
+        operating_cost:
+          operatingCost,
         net_profit: netProfit,
-        roi: Number(roi.toFixed(2))
+        roi:
+          vehicle.acquisition_cost > 0
+            ? Number(
+                (
+                  (netProfit /
+                    vehicle.acquisition_cost) *
+                  100
+                ).toFixed(2),
+              )
+            : 0,
       };
     });
-    return res.json(list);
-  } else {
-    // type === "FUEL"
-    const list = db.vehicles.map(v => {
-      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED && isWithinRange(t.completed_at || t.created_at));
-      const dist = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
-      const fuel = completed.reduce((sum, t) => sum + (t.fuel_consumed || 0), 0);
 
-      const efficiency = fuel > 0 ? Number((dist / fuel).toFixed(2)) : 0;
-      return {
-        vehicle_id: v.id,
-        registration_number: v.registration_number,
-        vehicle_name: v.vehicle_name,
-        total_distance: dist,
-        total_fuel: fuel,
-        current_odometer: v.odometer || 0,
-        efficiency: efficiency
-      };
-    });
-    return res.json(list);
-  }
-});
-
-apiRouter.get(
-  "/reports/download",
-  authenticateJWT,
-  requireRole(REPORT_ROLES),
-  (req, res) => {
-  const { start_date, end_date, type } = req.query;
-  const start = start_date ? new Date(start_date as string) : null;
-  const end = end_date ? new Date(end_date as string) : null;
-
-  if (start) start.setHours(0, 0, 0, 0);
-  if (end) end.setHours(23, 59, 59, 999);
-
-  const isWithinRange = (dateStr?: string) => {
-    if (!dateStr) return false;
-    const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return false;
-    if (start && d < start) return false;
-    if (end && d > end) return false;
-    return true;
+  return {
+    type: "VEHICLE",
+    columns: [
+      {
+        key: "registration",
+        label: "Registration",
+        format: "text",
+      },
+      {
+        key: "vehicle",
+        label: "Vehicle",
+        format: "text",
+      },
+      {
+        key: "completed_trips",
+        label: "Completed Trips",
+        format: "number",
+      },
+      {
+        key: "distance",
+        label: "Distance (km)",
+        format: "number",
+      },
+      {
+        key: "revenue",
+        label: "Revenue",
+        format: "currency",
+      },
+      {
+        key: "operating_cost",
+        label: "Operating Cost",
+        format: "currency",
+      },
+      {
+        key: "net_profit",
+        label: "Net Profit",
+        format: "currency",
+      },
+      {
+        key: "roi",
+        label: "ROI",
+        format: "percent",
+      },
+    ],
+    rows,
+    summary: [
+      {
+        label: "Completed Trips",
+        value: rows.reduce(
+          (sum, row) =>
+            sum +
+            Number(row.completed_trips),
+          0,
+        ),
+        format: "number",
+      },
+      {
+        label: "Revenue",
+        value: rows.reduce(
+          (sum, row) =>
+            sum + Number(row.revenue),
+          0,
+        ),
+        format: "currency",
+      },
+      {
+        label: "Net Profit",
+        value: rows.reduce(
+          (sum, row) =>
+            sum +
+            Number(row.net_profit),
+          0,
+        ),
+        format: "currency",
+      },
+    ],
   };
-
-  let csvContent = "";
-
-  if (type === "ROI") {
-    csvContent += "Registration,Vehicle Name,Acquisition Cost (Rs.),Total Revenue (Rs.),Total Fuel Cost (Rs.),Servicing Cost (Rs.),Net Profit (Rs.),ROI (%)\n";
-    db.vehicles.forEach(v => {
-      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED && isWithinRange(t.completed_at || t.created_at));
-      const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
-      const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id && isWithinRange(f.fuel_date || f.created_at)).reduce((sum, f) => sum + f.fuel_cost, 0);
-      const mnt = db.maintenance_logs.filter(m => m.vehicle_id === v.id && isWithinRange(m.completed_date || m.start_date || m.created_at)).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
-      const cost = fuel + mnt;
-      const netProfit = revenue - cost;
-      const roi = v.acquisition_cost > 0 ? ((netProfit / v.acquisition_cost) * 100).toFixed(1) : "0.0";
-      csvContent += `"${v.registration_number}","${v.vehicle_name}",${v.acquisition_cost || 0},${revenue},${fuel},${mnt},${netProfit},${roi}%\n`;
-    });
-  } else {
-    csvContent += "Registration,Vehicle Name,Total Distance (km),Total Fuel Consumed (L),Current Odometer (km),Efficiency (km/L)\n";
-    db.vehicles.forEach(v => {
-      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED && isWithinRange(t.completed_at || t.created_at));
-      const dist = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
-      const fuel = completed.reduce((sum, t) => sum + (t.fuel_consumed || 0), 0);
-      const eff = fuel > 0 ? (dist / fuel).toFixed(2) : "0.00";
-      csvContent += `"${v.registration_number}","${v.vehicle_name}",${dist},${fuel},${v.odometer || 0},${eff}\n`;
-    });
-  }
-
-  res.setHeader("Content-Type", "text/csv");
-  res.setHeader("Content-Disposition", `attachment; filename=transitops-${type || "report"}-${new Date().toISOString().split("T")[0]}.csv`);
-  res.status(200).send(csvContent);
-});
+}
 
 apiRouter.get(
-  "/reports/export/csv",
+  "/reports/options",
   authenticateJWT,
   requireRole(REPORT_ROLES),
-  (req, res) => {
-  const { type } = req.query;
+  (req: AuthenticatedRequest, res) => {
+    const allowedTypes =
+      REPORT_TYPES_BY_ROLE[req.user!.role];
 
-  let csvContent = "";
-
-  if (type === "vehicle-performance") {
-    csvContent += "Registration,Vehicle Name,Total Trips,Total Distance (km),Total Revenue (Rs.),Operational Cost (Rs.),Net Profit (Rs.)\n";
-    db.vehicles.forEach(v => {
-      const vTrips = db.trips.filter(t => t.vehicle_id === v.id);
-      const completed = vTrips.filter(t => t.status === TripStatus.COMPLETED);
-      const distance = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
-      const revenue = completed.reduce((sum, t) => sum + t.revenue, 0);
-      const fuel = db.fuel_logs.filter(f => f.vehicle_id === v.id).reduce((sum, f) => sum + f.fuel_cost, 0);
-      const mnt = db.maintenance_logs.filter(m => m.vehicle_id === v.id).reduce((sum, m) => sum + (m.actual_cost || 0), 0);
-      const cost = fuel + mnt;
-      csvContent += `"${v.registration_number}","${v.vehicle_name}",${vTrips.length},${distance},${revenue},${cost},${revenue - cost}\n`;
+    return res.json({
+      report_types: allowedTypes,
+      vehicles: db.vehicles
+        .map((vehicle) => ({
+          id: vehicle.id,
+          label: `${vehicle.registration_number} — ${vehicle.vehicle_name}`,
+        }))
+        .sort((first, second) =>
+          first.label.localeCompare(
+            second.label,
+          ),
+        ),
+      drivers: db.drivers
+        .map((driver) => ({
+          id: driver.id,
+          label: driver.full_name,
+        }))
+        .sort((first, second) =>
+          first.label.localeCompare(
+            second.label,
+          ),
+        ),
     });
-  } else if (type === "fuel-efficiency") {
-    csvContent += "Registration,Vehicle Name,Completed Trips,Total Distance (km),Fuel Consumed (L),Efficiency (km/L)\n";
-    db.vehicles.forEach(v => {
-      const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
-      const dist = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
-      const fuel = completed.reduce((sum, t) => sum + (t.fuel_consumed || 0), 0);
-      const eff = fuel > 0 ? (dist / fuel).toFixed(2) : "0.00";
-      csvContent += `"${v.registration_number}","${v.vehicle_name}",${completed.length},${dist},${fuel},${eff}\n`;
-    });
-  } else {
-    csvContent += "Operational Overview Report\n";
-    csvContent += `Total Vehicles,${db.vehicles.length}\n`;
-    csvContent += `Total Drivers,${db.drivers.length}\n`;
-    csvContent += `Total Trips Logged,${db.trips.length}\n`;
-    csvContent += `Total Expenses Logged,${db.expenses.reduce((sum, e) => sum + e.amount, 0)}\n`;
-  }
+  },
+);
 
-  res.setHeader("Content-Type", "text/csv");
-  res.setHeader("Content-Disposition", `attachment; filename=transitops-${type || "report"}-${new Date().toISOString().split("T")[0]}.csv`);
-  res.status(200).send(csvContent);
-});
+apiRouter.get(
+  "/reports/analytics",
+  authenticateJWT,
+  requireRole(REPORT_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const type = getSingleQueryValue(
+      req.query.type,
+    );
+    const startDate = getSingleQueryValue(
+      req.query.start_date,
+    );
+    const endDate = getSingleQueryValue(
+      req.query.end_date,
+    );
+    const vehicleId = getSingleQueryValue(
+      req.query.vehicle_id,
+    );
+    const driverId = getSingleQueryValue(
+      req.query.driver_id,
+    );
 
+    if (!isAnalyticsReportType(type)) {
+      return res.status(400).json({
+        error: "A valid report type is required.",
+      });
+    }
+
+    const allowedTypes =
+      REPORT_TYPES_BY_ROLE[req.user!.role];
+
+    if (!allowedTypes.includes(type)) {
+      return res.status(403).json({
+        error:
+          "Your role cannot access this report type.",
+      });
+    }
+
+    const dateRange = getReportDateRange(
+      startDate,
+      endDate,
+    );
+
+    if ("error" in dateRange) {
+      return res.status(400).json({
+        error: dateRange.error,
+      });
+    }
+
+    if (
+      vehicleId &&
+      !db.vehicles.some(
+        (vehicle) =>
+          vehicle.id === vehicleId,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Selected vehicle was not found.",
+      });
+    }
+
+    if (
+      driverId &&
+      !db.drivers.some(
+        (driver) =>
+          driver.id === driverId,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Selected driver was not found.",
+      });
+    }
+
+    return res.json(
+      buildAnalyticsReport(
+        type,
+        dateRange.startTimestamp,
+        dateRange.endTimestamp,
+        vehicleId,
+        driverId,
+      ),
+    );
+  },
+);
 
 // ============================================================================
 // 10. NOTIFICATIONS ENDPOINTS
@@ -6540,9 +7813,7 @@ function canAccessNotification(
 ): boolean {
   return (
     notification.user_id === userId ||
-    notification.user_id === "all" ||
-    notification.notification_type ===
-      NotificationType.SYSTEM
+    notification.user_id === "all"
   );
 }
 
@@ -6550,7 +7821,39 @@ apiRouter.get(
   "/notifications",
   authenticateJWT,
   (req: AuthenticatedRequest, res) => {
-    const list = db.notifications.filter(
+    syncAutomatedNotifications();
+
+    const state =
+      getSingleQueryValue(req.query.state) ||
+      "ALL";
+    const type = getSingleQueryValue(
+      req.query.type,
+    );
+
+    if (
+      !["ALL", "UNREAD", "READ"].includes(
+        state,
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "Notification state must be ALL, UNREAD, or READ.",
+      });
+    }
+
+    if (
+      type &&
+      !Object.values(NotificationType).includes(
+        type as NotificationType,
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "Invalid notification type filter.",
+      });
+    }
+
+    let list = db.notifications.filter(
       (notification) =>
         canAccessNotification(
           req.user!.id,
@@ -6558,7 +7861,74 @@ apiRouter.get(
         ),
     );
 
-    return res.json(list);
+    if (state === "UNREAD") {
+      list = list.filter(
+        (notification) =>
+          !notification.is_read,
+      );
+    } else if (state === "READ") {
+      list = list.filter(
+        (notification) =>
+          notification.is_read,
+      );
+    }
+
+    if (type) {
+      list = list.filter(
+        (notification) =>
+          notification.notification_type ===
+          type,
+      );
+    }
+
+    list.sort((first, second) =>
+      second.created_at.localeCompare(
+        first.created_at,
+      ),
+    );
+
+    const pageSize = parsePositiveInteger(
+      req.query.page_size,
+      10,
+      50,
+    );
+    const requestedPage = parsePositiveInteger(
+      req.query.page,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const total = list.length;
+    const totalPages = Math.max(
+      1,
+      Math.ceil(total / pageSize),
+    );
+    const page = Math.min(
+      requestedPage,
+      totalPages,
+    );
+    const startIndex = (page - 1) * pageSize;
+    const data = list.slice(
+      startIndex,
+      startIndex + pageSize,
+    );
+    const unreadCount =
+      db.notifications.filter(
+        (notification) =>
+          !notification.is_read &&
+          canAccessNotification(
+            req.user!.id,
+            notification,
+          ),
+      ).length;
+
+    return res.json({
+      data,
+      total,
+      page,
+      page_size: pageSize,
+      total_pages: totalPages,
+      unread_count: unreadCount,
+    });
   },
 );
 
@@ -6566,6 +7936,8 @@ apiRouter.get(
   "/notifications/count",
   authenticateJWT,
   (req: AuthenticatedRequest, res) => {
+    syncAutomatedNotifications();
+
     const count = db.notifications.filter(
       (notification) =>
         !notification.is_read &&
@@ -6575,9 +7947,7 @@ apiRouter.get(
         ),
     ).length;
 
-    return res.json({
-      count,
-    });
+    return res.json({ count });
   },
 );
 
@@ -6646,6 +8016,105 @@ apiRouter.patch(
       success: true,
       updated_count: updatedCount,
     });
+  },
+);
+
+apiRouter.delete(
+  "/notifications/read",
+  authenticateJWT,
+  (req: AuthenticatedRequest, res) => {
+    const before = db.notifications.length;
+
+    for (
+      let index =
+        db.notifications.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
+      const notification =
+        db.notifications[index];
+
+      if (
+        notification.is_read &&
+        notification.user_id !== "all" &&
+        canAccessNotification(
+          req.user!.id,
+          notification,
+        )
+      ) {
+        db.notifications.splice(index, 1);
+      }
+    }
+
+    const deletedCount =
+      before - db.notifications.length;
+
+    if (deletedCount > 0) {
+      db.save();
+    }
+
+    return res.json({
+      success: true,
+      deleted_count: deletedCount,
+    });
+  },
+);
+
+apiRouter.delete(
+  "/notifications/:id",
+  authenticateJWT,
+  (req: AuthenticatedRequest, res) => {
+    const index =
+      db.notifications.findIndex(
+        (notification) =>
+          notification.id === req.params.id,
+      );
+
+    if (index === -1) {
+      return res.status(404).json({
+        error: "Notification not found.",
+      });
+    }
+
+    const notification =
+      db.notifications[index];
+
+    if (
+      !canAccessNotification(
+        req.user!.id,
+        notification,
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You cannot delete another user's notification.",
+      });
+    }
+
+    if (
+      notification.user_id === "all" &&
+      req.user!.role !== UserRole.ADMIN
+    ) {
+      return res.status(403).json({
+        error:
+          "Only an administrator can delete a shared notification.",
+      });
+    }
+
+    db.notifications.splice(index, 1);
+
+    try {
+      db.save();
+    } catch (error) {
+      db.notifications.splice(
+        index,
+        0,
+        notification,
+      );
+      throw error;
+    }
+
+    return res.json({ success: true });
   },
 );
 

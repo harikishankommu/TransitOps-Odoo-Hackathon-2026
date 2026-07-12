@@ -341,7 +341,11 @@ const AppContent: React.FC = () => {
       case "users":
         return <UsersPage />;
       case "notifications":
-        return <NotificationsPage />;
+        return (
+          <NotificationsPage
+            onNotificationsChanged={syncBadgeCount}
+          />
+        );
       default:
         return <DashboardPage />;
     }
