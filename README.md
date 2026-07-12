@@ -1355,9 +1355,9 @@ Object storage for uploaded documents or receipts
 
 ---
 
-## Demo Flow
+## Overall Flow
 
-A clear 3–5 minute demonstration can follow this order.
+A clear demonstration can follow this order.
 
 ### 1. Login and role control
 
