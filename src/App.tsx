@@ -9,6 +9,8 @@ import React, {
   useState,
 } from "react";
 
+import { Menu } from "lucide-react";
+
 import { Sidebar } from "./components/Sidebar.js";
 
 import {
@@ -92,6 +94,8 @@ const AppContent: React.FC = () => {
     useState(false);
   const [notificationsCount, setNotificationsCount] =
     useState(0);
+  const [isSidebarOpen, setIsSidebarOpen] =
+    useState(false);
 
   const [selectedVehicleId, setSelectedVehicleId] =
     useState<string | null>(null);
@@ -149,6 +153,28 @@ const AppContent: React.FC = () => {
     setSelectedMaintenanceId(null);
   }, [currentTab, user]);
 
+  useEffect(() => {
+    if (!isSidebarOpen) {
+      return;
+    }
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const handleEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setIsSidebarOpen(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleEscape);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleEscape);
+    };
+  }, [isSidebarOpen]);
+
   if (loading) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center space-y-4 bg-slate-950 text-slate-400">
@@ -190,6 +216,7 @@ const AppContent: React.FC = () => {
 
     setCurrentTab(tab);
     resetDetailViews();
+    setIsSidebarOpen(false);
   };
 
   const handleViewVehicleDetails = (
@@ -352,47 +379,77 @@ const AppContent: React.FC = () => {
   };
 
   return (
-    <div className="relative flex min-h-screen overflow-hidden bg-[#0A0A0A] font-sans text-white">
-      <div className="pointer-events-none absolute right-0 top-0 -z-10 h-full w-1/3 border-l border-white/5 bg-[#111111]" />
-      <div className="pointer-events-none absolute -bottom-24 -left-24 -z-10 h-96 w-96 rounded-full bg-blue-600/5 blur-[120px]" />
-      <div className="pointer-events-none absolute left-1/3 top-1/4 -z-10 h-72 w-72 rounded-full bg-blue-500/5 blur-[100px]" />
+    <div className="relative min-h-screen overflow-x-hidden bg-[#0A0A0A] font-sans text-white">
+      <div className="pointer-events-none fixed right-0 top-0 -z-10 h-full w-1/3 border-l border-white/5 bg-[#111111]" />
+      <div className="pointer-events-none fixed -bottom-24 -left-24 -z-10 h-96 w-96 rounded-full bg-blue-600/5 blur-[120px]" />
+      <div className="pointer-events-none fixed left-1/3 top-1/4 -z-10 h-72 w-72 rounded-full bg-blue-500/5 blur-[100px]" />
+
+      {isSidebarOpen && (
+        <button
+          type="button"
+          aria-label="Close navigation menu"
+          onClick={() => setIsSidebarOpen(false)}
+          className="fixed inset-0 z-40 bg-black/70 backdrop-blur-sm lg:hidden"
+        />
+      )}
 
       <Sidebar
         currentTab={currentTab}
         onTabChange={handleTabChange}
-        onLogout={logout}
+        onLogout={() => {
+          setIsSidebarOpen(false);
+          logout();
+        }}
         notificationsCount={notificationsCount}
+        isMobileOpen={isSidebarOpen}
+        onMobileClose={() => setIsSidebarOpen(false)}
       />
 
-      <div className="z-10 flex min-h-screen flex-1 flex-col pl-64">
-        <header className="sticky top-0 z-20 flex h-16 items-center justify-between border-b border-white/5 bg-[#0A0A0A]/80 px-8 backdrop-blur-md">
-          <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-white/40">
-            {new Date().toLocaleDateString([], {
-              weekday: "long",
-              year: "numeric",
-              month: "long",
-              day: "numeric",
-            })}
-          </span>
+      <div className="relative z-10 flex min-h-screen min-w-0 flex-col lg:pl-64">
+        <header className="sticky top-0 z-30 flex min-h-16 items-center justify-between gap-3 border-b border-white/5 bg-[#0A0A0A]/90 px-4 py-3 backdrop-blur-md sm:px-6 lg:px-8">
+          <div className="flex min-w-0 items-center gap-3">
+            <button
+              type="button"
+              aria-label="Open navigation menu"
+              aria-expanded={isSidebarOpen}
+              onClick={() => setIsSidebarOpen(true)}
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-sm border border-white/10 bg-white/5 text-white/70 transition-colors hover:bg-white/10 hover:text-white lg:hidden"
+            >
+              <Menu size={19} />
+            </button>
 
-          <div className="flex items-center gap-4 text-[10px] font-semibold uppercase tracking-wider text-white/50">
-            <span>
+            <span className="truncate font-mono text-[9px] font-semibold uppercase tracking-[0.12em] text-white/40 sm:text-[10px] sm:tracking-[0.2em]">
+              {new Date().toLocaleDateString([], {
+                weekday: "long",
+                year: "numeric",
+                month: "long",
+                day: "numeric",
+              })}
+            </span>
+          </div>
+
+          <div className="hidden min-w-0 items-center gap-4 text-[10px] font-semibold uppercase tracking-wider text-white/50 md:flex">
+            <span className="whitespace-nowrap">
               Terminal:{" "}
               <span className="font-mono font-bold text-blue-400">
                 Main Server
               </span>
             </span>
             <span className="text-white/10">|</span>
-            <span>
+            <span className="min-w-0 truncate">
               Auth Session:{" "}
               <span className="font-mono font-bold text-blue-400">
                 {user.email}
               </span>
             </span>
           </div>
+
+          <span className="max-w-32 truncate font-mono text-[9px] font-bold text-blue-400 md:hidden">
+            {user.email}
+          </span>
         </header>
 
-        <main className="mx-auto w-full max-w-7xl flex-1 p-8 pb-16">
+        <main className="mx-auto w-full min-w-0 max-w-7xl flex-1 px-4 pb-24 pt-5 sm:px-6 sm:pt-6 lg:px-8 lg:pb-16 lg:pt-8">
           {renderTabContent()}
         </main>
       </div>
