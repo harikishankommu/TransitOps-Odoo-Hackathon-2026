@@ -3,489 +3,899 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from "react";
-import { apiFetch } from "../utils/api.js";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import {
+  AlertTriangle,
+  Ban,
+  CheckCircle,
+  ChevronLeft,
+  ChevronRight,
+  Eye,
+  Plus,
+  RefreshCw,
+  Search,
+  Trash2,
+  Wrench,
+} from "lucide-react";
+
+import { CompleteMaintenanceModal } from "../components/CompleteMaintenanceModal.js";
+import { MaintenanceFormModal } from "../components/MaintenanceFormModal.js";
 import { useAuth } from "../context/AuthContext.js";
-import { UserRole } from "../types.js";
-import { Plus, Search, AlertTriangle, Wrench, CheckCircle, Clock, Check } from "lucide-react";
+import {
+  type MaintenanceLog,
+  MaintenanceStatus,
+  MaintenanceType,
+  UserRole,
+  type Vehicle,
+} from "../types.js";
+import { apiFetch } from "../utils/api.js";
 
-export const MaintenancePage: React.FC = () => {
+interface MaintenancePageProps {
+  onViewDetails: (
+    maintenanceId: string,
+  ) => void;
+}
+
+interface MaintenanceRecord
+  extends MaintenanceLog {
+  vehicle_name: string;
+  registration_number: string;
+  vehicle_reg: string;
+  vehicle_status: string | null;
+  vehicle_odometer: number | null;
+  vehicle_model: string | null;
+}
+
+interface MaintenanceListResponse {
+  data: MaintenanceRecord[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+interface VehicleListResponse {
+  data: Vehicle[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+const PAGE_SIZE = 10;
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return "Maintenance records could not be loaded.";
+}
+
+function isActiveStatus(
+  status: MaintenanceStatus,
+): boolean {
+  return [
+    MaintenanceStatus.OPEN,
+    MaintenanceStatus.IN_PROGRESS,
+  ].includes(status);
+}
+
+function formatDate(value?: string): string {
+  if (!value) {
+    return "—";
+  }
+
+  const date = new Date(`${value}T00:00:00`);
+
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleDateString();
+}
+
+function statusClass(
+  status: MaintenanceStatus,
+): string {
+  switch (status) {
+    case MaintenanceStatus.OPEN:
+      return "border-blue-900/40 bg-blue-950/40 text-blue-400";
+    case MaintenanceStatus.IN_PROGRESS:
+      return "border-amber-900/40 bg-amber-950/40 text-amber-400";
+    case MaintenanceStatus.COMPLETED:
+      return "border-emerald-900/40 bg-emerald-950/40 text-emerald-400";
+    case MaintenanceStatus.CANCELLED:
+      return "border-red-900/40 bg-red-950/40 text-red-400";
+    default:
+      return "border-slate-700 bg-slate-800 text-slate-300";
+  }
+}
+
+export const MaintenancePage: React.FC<
+  MaintenancePageProps
+> = ({ onViewDetails }) => {
   const { user } = useAuth();
-  const [logs, setLogs] = useState<any[]>([]);
-  const [vehicles, setVehicles] = useState<any[]>([]);
+
+  const [records, setRecords] = useState<
+    MaintenanceRecord[]
+  >([]);
+  const [allVehicles, setAllVehicles] =
+    useState<Vehicle[]>([]);
+  const [availableVehicles, setAvailableVehicles] =
+    useState<Vehicle[]>([]);
   const [loading, setLoading] = useState(true);
+  const [referenceLoading, setReferenceLoading] =
+    useState(false);
   const [error, setError] = useState("");
-  const [successMsg, setSuccessMsg] = useState("");
+  const [successMessage, setSuccessMessage] =
+    useState("");
 
-  // Filters
+  const [searchInput, setSearchInput] =
+    useState("");
   const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] =
+    useState("");
+  const [typeFilter, setTypeFilter] =
+    useState("");
+  const [vehicleFilter, setVehicleFilter] =
+    useState("");
+  const [sortBy, setSortBy] =
+    useState("created_at");
+  const [sortOrder, setSortOrder] =
+    useState<"asc" | "desc">("desc");
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] =
+    useState(1);
 
-  // Start Form states
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [formLoading, setFormLoading] = useState(false);
-  const [formError, setFormError] = useState("");
-  const [form, setForm] = useState({
-    vehicle_id: "",
-    maintenance_type: "Routine Oil Change",
-    estimated_cost: "",
-    service_provider: "",
-    description: "",
-    start_date: new Date().toISOString().split("T")[0],
-  });
+  const [showCreateModal, setShowCreateModal] =
+    useState(false);
+  const [
+    selectedCompletionRecord,
+    setSelectedCompletionRecord,
+  ] = useState<MaintenanceRecord | null>(
+    null,
+  );
 
-  // Complete Form states
-  const [showCompleteModal, setShowCompleteModal] = useState(false);
-  const [selectedLogId, setSelectedLogId] = useState("");
-  const [completeLoading, setCompleteLoading] = useState(false);
-  const [completeError, setCompleteError] = useState("");
-  const [completeForm, setCompleteForm] = useState({
-    actual_cost: "",
-    completed_date: new Date().toISOString().split("T")[0],
-    notes: "",
-  });
+  const canManage = Boolean(
+    user &&
+      [
+        UserRole.ADMIN,
+        UserRole.FLEET_MANAGER,
+      ].includes(user.role),
+  );
+  const canDelete =
+    user?.role === UserRole.ADMIN;
 
-  const fetchLogs = async () => {
-    try {
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setSearch(searchInput.trim());
+      setPage(1);
+    }, 300);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [searchInput]);
+
+  const fetchReferences =
+    useCallback(async (): Promise<void> => {
+      setReferenceLoading(true);
+
+      try {
+        const [vehicleList, availableList] =
+          await Promise.all([
+            apiFetch<VehicleListResponse>(
+              "/vehicles?page_size=100&sort_by=registration_number&sort_order=asc",
+            ),
+            apiFetch<Vehicle[]>(
+              "/vehicles/available",
+            ),
+          ]);
+
+        setAllVehicles(vehicleList.data);
+        setAvailableVehicles(availableList);
+      } catch (requestError) {
+        setError(getErrorMessage(requestError));
+      } finally {
+        setReferenceLoading(false);
+      }
+    }, []);
+
+  const fetchRecords =
+    useCallback(async (): Promise<void> => {
       setLoading(true);
-      const query = new URLSearchParams({ search });
-      const data = await apiFetch(`/maintenance?${query.toString()}`);
-      setLogs(data);
-    } catch (err: any) {
-      setError(err.message || "Failed to load maintenance records.");
-    } finally {
-      setLoading(false);
-    }
-  };
+      setError("");
 
-  const loadVehicles = async () => {
-    try {
-      const vData = await apiFetch("/vehicles/available");
-      setVehicles(vData);
-    } catch (e) {
-      console.error("Failed to load available vehicles", e);
-    }
-  };
+      try {
+        const query = new URLSearchParams({
+          search,
+          status: statusFilter,
+          maintenance_type: typeFilter,
+          vehicle_id: vehicleFilter,
+          sort_by: sortBy,
+          sort_order: sortOrder,
+          page: String(page),
+          page_size: String(PAGE_SIZE),
+        });
+
+        const response =
+          await apiFetch<MaintenanceListResponse>(
+            `/maintenance?${query.toString()}`,
+          );
+
+        setRecords(response.data);
+        setTotal(response.total);
+        setTotalPages(response.total_pages);
+
+        if (response.page !== page) {
+          setPage(response.page);
+        }
+      } catch (requestError) {
+        setRecords([]);
+        setTotal(0);
+        setTotalPages(1);
+        setError(getErrorMessage(requestError));
+      } finally {
+        setLoading(false);
+      }
+    }, [
+      page,
+      search,
+      sortBy,
+      sortOrder,
+      statusFilter,
+      typeFilter,
+      vehicleFilter,
+    ]);
 
   useEffect(() => {
-    fetchLogs();
-  }, [search]);
+    void fetchRecords();
+  }, [fetchRecords]);
 
   useEffect(() => {
-    if (showAddModal) {
-      loadVehicles();
-    }
-  }, [showAddModal]);
+    void fetchReferences();
+  }, [fetchReferences]);
 
-  const handleStartMaintenance = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setFormLoading(true);
-    setFormError("");
+  const showSuccess = (
+    message: string,
+  ): void => {
+    setSuccessMessage(message);
+    window.setTimeout(() => {
+      setSuccessMessage("");
+    }, 5000);
+  };
+
+  const handleCreated = async (
+    message: string,
+  ): Promise<void> => {
+    setShowCreateModal(false);
+    showSuccess(message);
+    await Promise.all([
+      fetchRecords(),
+      fetchReferences(),
+    ]);
+  };
+
+  const handleCompleted = async (
+    message: string,
+  ): Promise<void> => {
+    setSelectedCompletionRecord(null);
+    showSuccess(message);
+    await Promise.all([
+      fetchRecords(),
+      fetchReferences(),
+    ]);
+  };
+
+  const handleCancel = async (
+    record: MaintenanceRecord,
+  ): Promise<void> => {
+    const confirmed = window.confirm(
+      `Cancel maintenance for ${record.vehicle_name} (${record.registration_number})? The vehicle will return to AVAILABLE status.`,
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setError("");
 
     try {
-      await apiFetch("/maintenance", {
-        method: "POST",
-        body: JSON.stringify({
-          ...form,
-          estimated_cost: Number(form.estimated_cost),
-        }),
-      });
+      await apiFetch(
+        `/maintenance/${record.id}/cancel`,
+        { method: "POST" },
+      );
 
-      setSuccessMsg("Vehicle marked as IN SHOP. Dispatch is blocked for this asset.");
-      setShowAddModal(false);
-      setForm({
-        vehicle_id: "",
-        maintenance_type: "Routine Oil Change",
-        estimated_cost: "",
-        service_provider: "",
-        description: "",
-        start_date: new Date().toISOString().split("T")[0],
-      });
-      fetchLogs();
-      setTimeout(() => setSuccessMsg(""), 5000);
-    } catch (err: any) {
-      setFormError(err.message || "Failed to initiate workshop entry.");
-    } finally {
-      setFormLoading(false);
+      showSuccess(
+        "Maintenance cancelled. The vehicle is AVAILABLE again.",
+      );
+
+      await Promise.all([
+        fetchRecords(),
+        fetchReferences(),
+      ]);
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
     }
   };
 
-  const openCompleteModal = (log: any) => {
-    setSelectedLogId(log.id);
-    setCompleteForm({
-      actual_cost: log.estimated_cost.toString(),
-      completed_date: new Date().toISOString().split("T")[0],
-      notes: "",
-    });
-    setCompleteError("");
-    setShowCompleteModal(true);
-  };
+  const handleDelete = async (
+    record: MaintenanceRecord,
+  ): Promise<void> => {
+    const confirmed = window.confirm(
+      `Permanently delete cancelled maintenance record ${record.id}?`,
+    );
 
-  const handleCompleteMaintenance = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setCompleteLoading(true);
-    setCompleteError("");
+    if (!confirmed) {
+      return;
+    }
+
+    setError("");
 
     try {
-      await apiFetch(`/maintenance/${selectedLogId}/complete`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          actual_cost: Number(completeForm.actual_cost),
-          completed_date: completeForm.completed_date,
-          notes: completeForm.notes,
-        }),
-      });
+      await apiFetch(
+        `/maintenance/${record.id}`,
+        { method: "DELETE" },
+      );
 
-      setSuccessMsg("Maintenance order closed. Vehicle restored to AVAILABLE status.");
-      setShowCompleteModal(false);
-      fetchLogs();
-      setTimeout(() => setSuccessMsg(""), 5000);
-    } catch (err: any) {
-      setCompleteError(err.message || "Failed to log completion.");
-    } finally {
-      setCompleteLoading(false);
+      showSuccess(
+        "Cancelled maintenance record deleted.",
+      );
+
+      await fetchRecords();
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
     }
   };
 
-  const isElevated = user && [UserRole.ADMIN, UserRole.FLEET_MANAGER].includes(user.role);
+  const clearFilters = (): void => {
+    setSearchInput("");
+    setSearch("");
+    setStatusFilter("");
+    setTypeFilter("");
+    setVehicleFilter("");
+    setSortBy("created_at");
+    setSortOrder("desc");
+    setPage(1);
+  };
+
+  const filtersActive = useMemo(
+    () =>
+      Boolean(
+        searchInput ||
+          statusFilter ||
+          typeFilter ||
+          vehicleFilter,
+      ),
+    [
+      searchInput,
+      statusFilter,
+      typeFilter,
+      vehicleFilter,
+    ],
+  );
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h2 className="text-2xl font-bold text-slate-100">Workshop & Servicing</h2>
-          <p className="text-sm text-slate-400">Log oil checks, engine tune-ups, workshop records, and restore assets</p>
+          <h2 className="text-2xl font-bold text-slate-100">
+            Workshop & Maintenance
+          </h2>
+          <p className="text-sm text-slate-400">
+            Manage service records, workshop status,
+            costs, and vehicle availability.
+          </p>
         </div>
-        {isElevated && (
+
+        {canManage && (
           <button
-            onClick={() => setShowAddModal(true)}
-            className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2.5 rounded-lg text-sm flex items-center gap-2 cursor-pointer transition-colors"
+            type="button"
+            onClick={() =>
+              setShowCreateModal(true)
+            }
+            disabled={
+              referenceLoading ||
+              availableVehicles.length === 0
+            }
+            className="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-bold text-slate-950 transition-colors hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <Plus size={16} className="stroke-[2.5]" />
-            <span>Schedule Workshop Entry</span>
+            <Plus size={16} />
+            Start Maintenance
           </button>
         )}
       </div>
 
-      {successMsg && (
-        <div className="bg-emerald-950/40 border border-emerald-900 text-emerald-200 px-4 py-3 rounded-lg text-sm font-semibold">
-          {successMsg}
+      {successMessage && (
+        <div className="rounded-lg border border-emerald-900 bg-emerald-950/40 px-4 py-3 text-sm font-semibold text-emerald-200">
+          {successMessage}
         </div>
       )}
 
-      {/* Query filters */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-        <label className="text-xs font-semibold text-slate-400 uppercase block mb-1.5">Search Workshop Log</label>
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600" size={16} />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search by vehicle reg, maintenance type, service provider..."
-            className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-4 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
-          />
+      {error && (
+        <div className="flex flex-col gap-3 rounded-lg border border-red-900 bg-red-950/30 px-4 py-3 text-sm text-red-200 sm:flex-row sm:items-center sm:justify-between">
+          <span>{error}</span>
+          <button
+            type="button"
+            onClick={() => {
+              void fetchRecords();
+              void fetchReferences();
+            }}
+            className="inline-flex items-center gap-1.5 text-xs font-bold uppercase text-red-100"
+          >
+            <RefreshCw size={13} />
+            Retry
+          </button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-4 rounded-xl border border-slate-800 bg-slate-900 p-5 md:grid-cols-2 xl:grid-cols-5">
+        <label className="space-y-1.5 md:col-span-2">
+          <span className="text-xs font-semibold uppercase text-slate-400">
+            Search
+          </span>
+          <div className="relative">
+            <Search
+              size={16}
+              className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600"
+            />
+            <input
+              type="text"
+              value={searchInput}
+              onChange={(event) =>
+                setSearchInput(event.target.value)
+              }
+              placeholder="Vehicle, registration, provider, description..."
+              className="w-full rounded-lg border border-slate-800 bg-slate-950 py-2 pl-9 pr-3 text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-emerald-500"
+            />
+          </div>
+        </label>
+
+        <label className="space-y-1.5">
+          <span className="text-xs font-semibold uppercase text-slate-400">
+            Status
+          </span>
+          <select
+            value={statusFilter}
+            onChange={(event) => {
+              setStatusFilter(event.target.value);
+              setPage(1);
+            }}
+            className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-500"
+          >
+            <option value="">All Statuses</option>
+            {Object.values(
+              MaintenanceStatus,
+            ).map((status) => (
+              <option
+                key={status}
+                value={status}
+              >
+                {status.replaceAll("_", " ")}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="space-y-1.5">
+          <span className="text-xs font-semibold uppercase text-slate-400">
+            Type
+          </span>
+          <select
+            value={typeFilter}
+            onChange={(event) => {
+              setTypeFilter(event.target.value);
+              setPage(1);
+            }}
+            className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-500"
+          >
+            <option value="">All Types</option>
+            {Object.values(
+              MaintenanceType,
+            ).map((type) => (
+              <option
+                key={type}
+                value={type}
+              >
+                {type}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="space-y-1.5">
+          <span className="text-xs font-semibold uppercase text-slate-400">
+            Vehicle
+          </span>
+          <select
+            value={vehicleFilter}
+            onChange={(event) => {
+              setVehicleFilter(event.target.value);
+              setPage(1);
+            }}
+            className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-500"
+          >
+            <option value="">All Vehicles</option>
+            {allVehicles.map((vehicle) => (
+              <option
+                key={vehicle.id}
+                value={vehicle.id}
+              >
+                {vehicle.registration_number}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <div className="flex flex-col gap-3 rounded-lg border border-slate-800 bg-slate-900/50 px-4 py-3 text-xs sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-wrap items-center gap-3 text-slate-400">
+          <span>
+            Total:{" "}
+            <strong className="text-slate-200">
+              {total}
+            </strong>
+          </span>
+
+          <label className="flex items-center gap-2">
+            <span>Sort by</span>
+            <select
+              value={sortBy}
+              onChange={(event) => {
+                setSortBy(event.target.value);
+                setPage(1);
+              }}
+              className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-slate-200"
+            >
+              <option value="created_at">
+                Created
+              </option>
+              <option value="start_date">
+                Start Date
+              </option>
+              <option value="expected_completion_date">
+                Expected Completion
+              </option>
+              <option value="estimated_cost">
+                Estimated Cost
+              </option>
+              <option value="actual_cost">
+                Actual Cost
+              </option>
+              <option value="status">
+                Status
+              </option>
+              <option value="maintenance_type">
+                Type
+              </option>
+              <option value="service_provider">
+                Provider
+              </option>
+            </select>
+          </label>
+
+          <button
+            type="button"
+            onClick={() => {
+              setSortOrder((current) =>
+                current === "asc"
+                  ? "desc"
+                  : "asc",
+              );
+              setPage(1);
+            }}
+            className="rounded border border-slate-700 bg-slate-950 px-2 py-1 font-bold text-slate-200"
+          >
+            {sortOrder === "asc"
+              ? "Ascending"
+              : "Descending"}
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {filtersActive && (
+            <button
+              type="button"
+              onClick={clearFilters}
+              className="text-slate-400 transition-colors hover:text-white"
+            >
+              Clear Filters
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => {
+              void fetchRecords();
+              void fetchReferences();
+            }}
+            className="inline-flex items-center gap-1.5 rounded border border-slate-700 px-2.5 py-1.5 text-slate-300 transition-colors hover:bg-slate-800"
+          >
+            <RefreshCw size={13} />
+            Refresh
+          </button>
         </div>
       </div>
 
-      {/* Listings */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+      <div className="overflow-hidden rounded-xl border border-slate-800 bg-slate-900">
         {loading ? (
-          <div className="p-12 text-center text-slate-400 font-mono text-sm uppercase">
-            Loading workshop records...
+          <div className="p-14 text-center font-mono text-sm uppercase tracking-wider text-slate-400">
+            Loading maintenance records...
           </div>
-        ) : logs.length === 0 ? (
+        ) : records.length === 0 ? (
           <div className="p-16 text-center text-slate-500">
-            <AlertTriangle className="mx-auto text-slate-600 mb-3" size={36} />
-            <p className="font-bold text-slate-400">No Workshop Logs</p>
-            <p className="text-xs text-slate-500 mt-1">Adjust search or register a new service log.</p>
+            <AlertTriangle
+              size={36}
+              className="mx-auto mb-3 text-slate-600"
+            />
+            <p className="font-bold text-slate-300">
+              No Maintenance Records Found
+            </p>
+            <p className="mt-1 text-xs">
+              Adjust filters or start a new
+              maintenance workflow.
+            </p>
           </div>
         ) : (
-          <div className="overflow-x-auto text-sm text-slate-300">
-            <table className="w-full text-left">
-              <thead className="bg-slate-950 text-slate-400 text-xs uppercase tracking-wider border-b border-slate-800">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm text-slate-300">
+              <thead className="border-b border-slate-800 bg-slate-950 text-xs uppercase tracking-wider text-slate-400">
                 <tr>
-                  <th className="px-6 py-4">Vehicle Details</th>
-                  <th className="px-6 py-4">Service Details</th>
-                  <th className="px-6 py-4">Workshop / Provider</th>
-                  <th className="px-6 py-4">Estimated Cost</th>
-                  <th className="px-6 py-4">Workflow Status</th>
-                  {isElevated && <th className="px-6 py-4 text-right">Actions</th>}
+                  <th className="px-5 py-4">
+                    Vehicle
+                  </th>
+                  <th className="px-5 py-4">
+                    Service
+                  </th>
+                  <th className="px-5 py-4">
+                    Timeline
+                  </th>
+                  <th className="px-5 py-4">
+                    Cost
+                  </th>
+                  <th className="px-5 py-4">
+                    Status
+                  </th>
+                  <th className="px-5 py-4 text-right">
+                    Actions
+                  </th>
                 </tr>
               </thead>
+
               <tbody className="divide-y divide-slate-800/60">
-                {logs.map((log) => (
-                  <tr key={log.id} className="hover:bg-slate-800/40 transition-colors">
-                    <td className="px-6 py-4">
-                      <div className="font-bold text-slate-100">{log.vehicle_name}</div>
-                      <div className="text-xs text-slate-500 font-mono mt-0.5">{log.registration_number}</div>
-                    </td>
-                    <td className="px-6 py-4 space-y-1 max-w-xs">
-                      <span className="font-semibold text-slate-200">{log.maintenance_type}</span>
-                      <p className="text-xs text-slate-500 line-clamp-1 italic">"{log.description}"</p>
-                      <div className="text-[10px] text-slate-500 flex gap-4 font-mono pt-1">
-                        <span>Started: {log.start_date}</span>
-                        {log.completed_date && <span>Completed: {log.completed_date}</span>}
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 text-slate-300">
-                      {log.service_provider}
-                    </td>
-                    <td className="px-6 py-4 font-mono space-y-0.5">
-                      <div className="text-slate-400 text-xs">Est: Rs. {(log.estimated_cost ?? 0).toLocaleString()}</div>
-                      {log.actual_cost !== null && log.actual_cost !== undefined && (
-                        <div className="text-emerald-400 font-bold">Act: Rs. {Number(log.actual_cost).toLocaleString()}</div>
-                      )}
-                    </td>
-                    <td className="px-6 py-4">
-                      {log.actual_cost === null ? (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-950 text-amber-400 border border-amber-900/50">
-                          <Clock size={12} /> In Workshop
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-900/40">
-                          <CheckCircle size={12} /> Closed
-                        </span>
-                      )}
-                    </td>
-                    {isElevated && (
-                      <td className="px-6 py-4 text-right">
-                        {log.actual_cost === null && (
-                          <button
-                            onClick={() => openCompleteModal(log)}
-                            className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-3 py-1.5 rounded text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
-                          >
-                            <Check size={12} /> Release & Close
-                          </button>
+                {records.map((record) => {
+                  const active = isActiveStatus(
+                    record.status,
+                  );
+
+                  return (
+                    <tr
+                      key={record.id}
+                      className="transition-colors hover:bg-slate-800/30"
+                    >
+                      <td className="px-5 py-4">
+                        <div className="font-bold text-slate-100">
+                          {record.vehicle_name}
+                        </div>
+                        <div className="mt-0.5 font-mono text-xs text-slate-500">
+                          {record.registration_number}
+                        </div>
+                        <div className="mt-1 text-[10px] uppercase text-slate-600">
+                          {record.vehicle_status ??
+                            "Unknown status"}
+                        </div>
+                      </td>
+
+                      <td className="max-w-xs px-5 py-4">
+                        <div className="font-semibold text-slate-200">
+                          {record.maintenance_type}
+                        </div>
+                        <div className="mt-0.5 text-xs text-slate-500">
+                          {record.service_provider}
+                        </div>
+                        <p className="mt-1 truncate text-xs italic text-slate-600">
+                          {record.description}
+                        </p>
+                      </td>
+
+                      <td className="px-5 py-4 text-xs">
+                        <div>
+                          Started:{" "}
+                          <span className="font-mono text-slate-300">
+                            {formatDate(
+                              record.start_date,
+                            )}
+                          </span>
+                        </div>
+                        <div className="mt-1">
+                          Expected:{" "}
+                          <span className="font-mono text-slate-300">
+                            {formatDate(
+                              record.expected_completion_date,
+                            )}
+                          </span>
+                        </div>
+                        {record.completed_date && (
+                          <div className="mt-1">
+                            Completed:{" "}
+                            <span className="font-mono text-emerald-400">
+                              {formatDate(
+                                record.completed_date,
+                              )}
+                            </span>
+                          </div>
                         )}
                       </td>
-                    )}
-                  </tr>
-                ))}
+
+                      <td className="px-5 py-4 font-mono text-xs">
+                        <div className="text-slate-400">
+                          Est. Rs.{" "}
+                          {record.estimated_cost.toLocaleString()}
+                        </div>
+                        {record.actual_cost !==
+                          undefined && (
+                          <div className="mt-1 font-bold text-emerald-400">
+                            Act. Rs.{" "}
+                            {record.actual_cost.toLocaleString()}
+                          </div>
+                        )}
+                      </td>
+
+                      <td className="px-5 py-4">
+                        <span
+                          className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase ${statusClass(
+                            record.status,
+                          )}`}
+                        >
+                          {record.status.replaceAll(
+                            "_",
+                            " ",
+                          )}
+                        </span>
+                      </td>
+
+                      <td className="px-5 py-4">
+                        <div className="flex flex-wrap justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onViewDetails(
+                                record.id,
+                              )
+                            }
+                            className="inline-flex items-center gap-1 rounded border border-slate-700 px-2.5 py-1.5 text-xs font-bold text-slate-300 transition-colors hover:bg-slate-800 hover:text-white"
+                          >
+                            <Eye size={13} />
+                            View
+                          </button>
+
+                          {canManage && active && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setSelectedCompletionRecord(
+                                    record,
+                                  )
+                                }
+                                className="inline-flex items-center gap-1 rounded bg-emerald-500 px-2.5 py-1.5 text-xs font-bold text-slate-950 transition-colors hover:bg-emerald-400"
+                              >
+                                <CheckCircle
+                                  size={13}
+                                />
+                                Complete
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  void handleCancel(
+                                    record,
+                                  );
+                                }}
+                                className="inline-flex items-center gap-1 rounded border border-red-900 px-2.5 py-1.5 text-xs font-bold text-red-400 transition-colors hover:bg-red-950/30"
+                              >
+                                <Ban size={13} />
+                                Cancel
+                              </button>
+                            </>
+                          )}
+
+                          {canDelete &&
+                            record.status ===
+                              MaintenanceStatus.CANCELLED && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  void handleDelete(
+                                    record,
+                                  );
+                                }}
+                                className="inline-flex items-center gap-1 rounded border border-red-900 px-2.5 py-1.5 text-xs font-bold text-red-400 transition-colors hover:bg-red-950/30"
+                              >
+                                <Trash2 size={13} />
+                                Delete
+                              </button>
+                            )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
+
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between border-t border-slate-800 bg-slate-950 px-5 py-4 text-xs">
+            <button
+              type="button"
+              onClick={() =>
+                setPage((current) =>
+                  Math.max(1, current - 1),
+                )
+              }
+              disabled={page <= 1}
+              className="inline-flex items-center gap-1 rounded border border-slate-800 px-3 py-1.5 text-slate-300 transition-colors hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <ChevronLeft size={14} />
+              Previous
+            </button>
+
+            <span className="font-mono text-slate-400">
+              Page {page} of {totalPages}
+            </span>
+
+            <button
+              type="button"
+              onClick={() =>
+                setPage((current) =>
+                  Math.min(
+                    totalPages,
+                    current + 1,
+                  ),
+                )
+              }
+              disabled={page >= totalPages}
+              className="inline-flex items-center gap-1 rounded border border-slate-800 px-3 py-1.5 text-slate-300 transition-colors hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Next
+              <ChevronRight size={14} />
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Start Maintenance Modal */}
-      {showAddModal && (
-        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-md w-full p-6 shadow-2xl">
-            <div className="flex justify-between items-center border-b border-slate-800 pb-3 mb-5">
-              <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                <Wrench size={18} className="text-emerald-400" /> Start Workshop Order
-              </h3>
-              <button
-                onClick={() => setShowAddModal(false)}
-                className="text-slate-500 hover:text-slate-300 text-lg font-bold bg-transparent border-none cursor-pointer"
-              >
-                ✕
-              </button>
-            </div>
-
-            {formError && (
-              <div className="mb-4 bg-red-950/40 border border-red-900 text-red-200 p-3 rounded text-xs font-semibold">
-                {formError}
-              </div>
-            )}
-
-            <form onSubmit={handleStartMaintenance} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Select Vehicle (Available Only)
-                </label>
-                <select
-                  value={form.vehicle_id}
-                  onChange={(e) => setForm({ ...form, vehicle_id: e.target.value })}
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                  required
-                >
-                  <option value="">Select a vehicle...</option>
-                  {vehicles.map((v) => (
-                    <option key={v.id} value={v.id}>
-                      {v.vehicle_name} ({v.registration_number}) - Cap: {v.maximum_load_capacity} kg
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Service Type
-                </label>
-                <select
-                  value={form.maintenance_type}
-                  onChange={(e) => setForm({ ...form, maintenance_type: e.target.value })}
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                >
-                  <option value="Routine Oil Change">Routine Oil Change</option>
-                  <option value="Tire Rotation & Replacement">Tire Rotation & Replacement</option>
-                  <option value="Brake System Tuneup">Brake System Tuneup</option>
-                  <option value="Suspension Maintenance">Suspension Maintenance</option>
-                  <option value="Engine Repair log">Engine Repair log</option>
-                  <option value="Accident Body Restoration">Accident Body Restoration</option>
-                </select>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Est Cost (Rs.)
-                  </label>
-                  <input
-                    type="number"
-                    value={form.estimated_cost}
-                    onChange={(e) => setForm({ ...form, estimated_cost: e.target.value })}
-                    placeholder="2500"
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                    required
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Entry Date
-                  </label>
-                  <input
-                    type="date"
-                    value={form.start_date}
-                    onChange={(e) => setForm({ ...form, start_date: e.target.value })}
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Workshop Provider / Garage name
-                </label>
-                <input
-                  type="text"
-                  value={form.service_provider}
-                  onChange={(e) => setForm({ ...form, service_provider: e.target.value })}
-                  placeholder="Tata Authorized Garage, Patna"
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                  required
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Service Cautions / Descriptions
-                </label>
-                <textarea
-                  value={form.description}
-                  onChange={(e) => setForm({ ...form, description: e.target.value })}
-                  placeholder="Notes on brake noises or regular filter replacements..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 h-16 resize-none"
-                  required
-                />
-              </div>
-
-              <div className="pt-4 flex justify-end gap-3 border-t border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setShowAddModal(false)}
-                  className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-white bg-transparent border border-slate-800 rounded-lg cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={formLoading}
-                  className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-lg text-xs cursor-pointer transition-colors"
-                >
-                  {formLoading ? "Sending to Shop..." : "Mark as In Shop"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+      {showCreateModal && (
+        <MaintenanceFormModal
+          vehicles={availableVehicles}
+          onClose={() =>
+            setShowCreateModal(false)
+          }
+          onSaved={(message) => {
+            void handleCreated(message);
+          }}
+        />
       )}
 
-      {/* Complete Maintenance Modal */}
-      {showCompleteModal && (
-        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-md w-full p-6 shadow-2xl">
-            <div className="flex justify-between items-center border-b border-slate-800 pb-3 mb-5">
-              <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                <CheckCircle size={18} className="text-emerald-400" /> Complete Workshop Order
-              </h3>
-              <button
-                onClick={() => setShowCompleteModal(false)}
-                className="text-slate-500 hover:text-slate-300 text-lg font-bold bg-transparent border-none cursor-pointer"
-              >
-                ✕
-              </button>
-            </div>
-
-            {completeError && (
-              <div className="mb-4 bg-red-950/40 border border-red-900 text-red-200 p-3 rounded text-xs font-semibold">
-                {completeError}
-              </div>
-            )}
-
-            <form onSubmit={handleCompleteMaintenance} className="space-y-4">
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Actual Repair Cost (Rs.)
-                  </label>
-                  <input
-                    type="number"
-                    value={completeForm.actual_cost}
-                    onChange={(e) => setCompleteForm({ ...completeForm, actual_cost: e.target.value })}
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                    required
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                    Release Date
-                  </label>
-                  <input
-                    type="date"
-                    value={completeForm.completed_date}
-                    onChange={(e) => setCompleteForm({ ...completeForm, completed_date: e.target.value })}
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase mb-1">
-                  Workshop Final Comments
-                </label>
-                <textarea
-                  value={completeForm.notes}
-                  onChange={(e) => setCompleteForm({ ...completeForm, notes: e.target.value })}
-                  placeholder="Engine oil replaced, brake pads restored. All tests passed..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 h-20 resize-none"
-                  required
-                />
-              </div>
-
-              <div className="pt-4 flex justify-end gap-3 border-t border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setShowCompleteModal(false)}
-                  className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-white bg-transparent border border-slate-800 rounded-lg cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={completeLoading}
-                  className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-lg text-xs cursor-pointer transition-colors"
-                >
-                  {completeLoading ? "Closing order..." : "Complete Repair & Release"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+      {selectedCompletionRecord && (
+        <CompleteMaintenanceModal
+          maintenance={
+            selectedCompletionRecord
+          }
+          onClose={() =>
+            setSelectedCompletionRecord(null)
+          }
+          onSaved={(message) => {
+            void handleCompleted(message);
+          }}
+        />
       )}
     </div>
   );

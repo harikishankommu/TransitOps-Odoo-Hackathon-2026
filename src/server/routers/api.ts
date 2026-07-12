@@ -3771,122 +3771,653 @@ apiRouter.post(
 // 6. MAINTENANCE MODULE ENDPOINTS
 // ============================================================================
 
+type MaintenanceSortField =
+  | "created_at"
+  | "start_date"
+  | "expected_completion_date"
+  | "completed_date"
+  | "estimated_cost"
+  | "actual_cost"
+  | "status"
+  | "maintenance_type"
+  | "service_provider";
+
+const MAINTENANCE_SORT_FIELDS =
+  new Set<MaintenanceSortField>([
+    "created_at",
+    "start_date",
+    "expected_completion_date",
+    "completed_date",
+    "estimated_cost",
+    "actual_cost",
+    "status",
+    "maintenance_type",
+    "service_provider",
+  ]);
+
+function isMaintenanceStatus(
+  value: unknown,
+): value is MaintenanceStatus {
+  return (
+    typeof value === "string" &&
+    Object.values(MaintenanceStatus).includes(
+      value as MaintenanceStatus,
+    )
+  );
+}
+
+function isMaintenanceType(
+  value: unknown,
+): value is MaintenanceType {
+  return (
+    typeof value === "string" &&
+    Object.values(MaintenanceType).includes(
+      value as MaintenanceType,
+    )
+  );
+}
+
+function normalizeMaintenanceText(
+  value: string,
+): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function compareMaintenanceValues(
+  first: MaintenanceLog,
+  second: MaintenanceLog,
+  field: MaintenanceSortField,
+  order: 1 | -1,
+): number {
+  const firstValue = first[field] ?? "";
+  const secondValue = second[field] ?? "";
+
+  if (
+    typeof firstValue === "number" &&
+    typeof secondValue === "number"
+  ) {
+    return (firstValue - secondValue) * order;
+  }
+
+  return (
+    String(firstValue).localeCompare(
+      String(secondValue),
+      undefined,
+      {
+        numeric: true,
+        sensitivity: "base",
+      },
+    ) * order
+  );
+}
+
+function serializeMaintenanceRecord(
+  log: MaintenanceLog,
+) {
+  const vehicle = db.vehicles.find(
+    (candidate) =>
+      candidate.id === log.vehicle_id,
+  );
+
+  return {
+    ...log,
+    vehicle_name:
+      vehicle?.vehicle_name ?? "Unknown Vehicle",
+    registration_number:
+      vehicle?.registration_number ?? "Unknown",
+    vehicle_reg:
+      vehicle?.registration_number ?? "Unknown",
+    vehicle_status: vehicle?.status ?? null,
+    vehicle_odometer: vehicle?.odometer ?? null,
+    vehicle_model: vehicle?.model ?? null,
+    vehicle_type: vehicle?.vehicle_type ?? null,
+    vehicle_region: vehicle?.region ?? null,
+  };
+}
+
 apiRouter.get(
   "/maintenance",
   authenticateJWT,
   requireRole(MAINTENANCE_ROLES),
   (req, res) => {
-  const { status, vehicle_id } = req.query;
+    const search = getSingleQueryValue(
+      req.query.search,
+    ).toLowerCase();
+    const status = getSingleQueryValue(
+      req.query.status,
+    );
+    const maintenanceType =
+      getSingleQueryValue(
+        req.query.maintenance_type,
+      );
+    const vehicleId = getSingleQueryValue(
+      req.query.vehicle_id,
+    );
+    const requestedSortField =
+      getSingleQueryValue(req.query.sort_by) ||
+      "created_at";
+    const requestedSortOrder =
+      getSingleQueryValue(req.query.sort_order) ||
+      "desc";
 
-  let list = [...db.maintenance_logs];
+    if (
+      status &&
+      !isMaintenanceStatus(status)
+    ) {
+      return res.status(400).json({
+        error:
+          "Invalid maintenance status filter.",
+      });
+    }
 
-  if (status) {
-    list = list.filter(m => m.status === status);
-  }
-  if (vehicle_id) {
-    list = list.filter(m => m.vehicle_id === vehicle_id);
-  }
+    if (
+      maintenanceType &&
+      !isMaintenanceType(maintenanceType)
+    ) {
+      return res.status(400).json({
+        error:
+          "Invalid maintenance type filter.",
+      });
+    }
 
-  // Denormalize vehicles
-  const result = list.map(m => {
-    const vehicle = db.vehicles.find(v => v.id === m.vehicle_id);
-    return {
-      ...m,
-      vehicle_reg: vehicle ? vehicle.registration_number : "Unknown",
-      vehicle_name: vehicle ? vehicle.vehicle_name : "Unknown"
-    };
-  });
+    if (
+      vehicleId &&
+      !db.vehicles.some(
+        (vehicle) => vehicle.id === vehicleId,
+      )
+    ) {
+      return res.status(400).json({
+        error: "Invalid vehicle filter.",
+      });
+    }
 
-  res.json(result);
-});
+    if (
+      !MAINTENANCE_SORT_FIELDS.has(
+        requestedSortField as MaintenanceSortField,
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "Invalid maintenance sort field.",
+      });
+    }
+
+    if (
+      requestedSortOrder !== "asc" &&
+      requestedSortOrder !== "desc"
+    ) {
+      return res.status(400).json({
+        error:
+          "Maintenance sort order must be asc or desc.",
+      });
+    }
+
+    let list = [...db.maintenance_logs];
+
+    if (search) {
+      list = list.filter((log) => {
+        const vehicle = db.vehicles.find(
+          (candidate) =>
+            candidate.id === log.vehicle_id,
+        );
+
+        return [
+          log.id,
+          log.maintenance_type,
+          log.description,
+          log.service_provider,
+          vehicle?.vehicle_name ?? "",
+          vehicle?.registration_number ?? "",
+          vehicle?.model ?? "",
+          vehicle?.region ?? "",
+        ].some((value) =>
+          value.toLowerCase().includes(search),
+        );
+      });
+    }
+
+    if (status) {
+      list = list.filter(
+        (log) => log.status === status,
+      );
+    }
+
+    if (maintenanceType) {
+      list = list.filter(
+        (log) =>
+          log.maintenance_type ===
+          maintenanceType,
+      );
+    }
+
+    if (vehicleId) {
+      list = list.filter(
+        (log) => log.vehicle_id === vehicleId,
+      );
+    }
+
+    const sortField =
+      requestedSortField as MaintenanceSortField;
+    const sortOrder: 1 | -1 =
+      requestedSortOrder === "asc" ? 1 : -1;
+
+    list.sort((first, second) =>
+      compareMaintenanceValues(
+        first,
+        second,
+        sortField,
+        sortOrder,
+      ),
+    );
+
+    const pageSize = parsePositiveInteger(
+      req.query.page_size,
+      10,
+      100,
+    );
+    const requestedPage = parsePositiveInteger(
+      req.query.page,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const total = list.length;
+    const totalPages = Math.max(
+      1,
+      Math.ceil(total / pageSize),
+    );
+    const page = Math.min(
+      requestedPage,
+      totalPages,
+    );
+    const startIndex = (page - 1) * pageSize;
+    const data = list
+      .slice(
+        startIndex,
+        startIndex + pageSize,
+      )
+      .map(serializeMaintenanceRecord);
+
+    return res.json({
+      data,
+      total,
+      page,
+      page_size: pageSize,
+      total_pages: totalPages,
+    });
+  },
+);
 
 apiRouter.get(
   "/maintenance/:id",
   authenticateJWT,
   requireRole(MAINTENANCE_ROLES),
   (req, res) => {
-  const log = db.maintenance_logs.find(m => m.id === req.params.id);
-  if (!log) return res.status(404).json({ error: "Maintenance log not found." });
-
-  const vehicle = db.vehicles.find(v => v.id === log.vehicle_id);
-  res.json({
-    ...log,
-    vehicle_reg: vehicle ? vehicle.registration_number : "Unknown",
-    vehicle_name: vehicle ? vehicle.vehicle_name : "Unknown"
-  });
-});
-
-apiRouter.post("/maintenance", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
-  const {
-    vehicle_id,
-    maintenance_type,
-    description,
-    service_provider,
-    start_date,
-    expected_completion_date,
-    estimated_cost,
-    odometer_at_service
-  } = req.body;
-
-  if (!vehicle_id || !maintenance_type || !start_date || !expected_completion_date || estimated_cost === undefined || odometer_at_service === undefined) {
-    return res.status(400).json({ error: "Missing required fields." });
-  }
-
-  try {
-    const operator = { id: req.user!.id, name: req.user!.full_name };
-    const log = OperationsService.startMaintenance(
-      {
-        vehicle_id,
-        maintenance_type: maintenance_type as MaintenanceType,
-        description: description || "",
-        service_provider: service_provider || "Internal",
-        start_date,
-        expected_completion_date,
-        estimated_cost: Number(estimated_cost),
-        odometer_at_service: Number(odometer_at_service)
-      },
-      operator
+    const log = db.maintenance_logs.find(
+      (candidate) =>
+        candidate.id === req.params.id,
     );
-    res.status(201).json(log);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
 
-apiRouter.post("/maintenance/:id/complete", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
-  const { actual_cost, completed_date, notes } = req.body;
+    if (!log) {
+      return res.status(404).json({
+        error:
+          "Maintenance record not found.",
+      });
+    }
 
-  if (actual_cost === undefined || !completed_date) {
-    return res.status(400).json({ error: "Actual cost and completed date are required." });
-  }
-
-  try {
-    const operator = { id: req.user!.id, name: req.user!.full_name };
-    const log = OperationsService.completeMaintenance(
-      req.params.id,
-      {
-        actual_cost: Number(actual_cost),
-        completed_date,
-        notes
-      },
-      operator
+    return res.json(
+      serializeMaintenanceRecord(log),
     );
-    res.json(log);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
+  },
+);
 
-apiRouter.post("/maintenance/:id/cancel", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
-  try {
-    const operator = { id: req.user!.id, name: req.user!.full_name };
-    const log = OperationsService.cancelMaintenance(req.params.id, operator);
-    res.json(log);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
+apiRouter.post(
+  "/maintenance",
+  authenticateJWT,
+  requireRole(MAINTENANCE_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const body = req.body ?? {};
 
+    if (
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return res.status(400).json({
+        error:
+          "A valid maintenance payload is required.",
+      });
+    }
+
+    const vehicleId =
+      typeof body.vehicle_id === "string"
+        ? body.vehicle_id.trim()
+        : "";
+    const description =
+      typeof body.description === "string"
+        ? normalizeMaintenanceText(
+            body.description,
+          )
+        : "";
+    const serviceProvider =
+      typeof body.service_provider === "string"
+        ? normalizeMaintenanceText(
+            body.service_provider,
+          )
+        : "";
+    const estimatedCost = parseFiniteNumber(
+      body.estimated_cost,
+    );
+    const serviceOdometer =
+      parseFiniteNumber(
+        body.odometer_at_service,
+      );
+
+    if (!vehicleId) {
+      return res.status(400).json({
+        error: "A vehicle is required.",
+      });
+    }
+
+    const vehicle = db.vehicles.find(
+      (candidate) =>
+        candidate.id === vehicleId,
+    );
+
+    if (!vehicle) {
+      return res.status(400).json({
+        error: "Selected vehicle was not found.",
+      });
+    }
+
+    if (
+      vehicle.status !==
+      VehicleStatus.AVAILABLE
+    ) {
+      return res.status(409).json({
+        error:
+          "Only AVAILABLE vehicles can enter maintenance.",
+      });
+    }
+
+    if (
+      !isMaintenanceType(
+        body.maintenance_type,
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "A valid maintenance type is required.",
+      });
+    }
+
+    if (
+      description.length < 3 ||
+      description.length > 500
+    ) {
+      return res.status(400).json({
+        error:
+          "Description must contain between 3 and 500 characters.",
+      });
+    }
+
+    if (
+      serviceProvider.length < 2 ||
+      serviceProvider.length > 100
+    ) {
+      return res.status(400).json({
+        error:
+          "Service provider must contain between 2 and 100 characters.",
+      });
+    }
+
+    if (
+      !isIsoDate(body.start_date) ||
+      !isIsoDate(
+        body.expected_completion_date,
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          "Start and expected completion dates must be valid dates.",
+      });
+    }
+
+    if (
+      body.expected_completion_date <
+      body.start_date
+    ) {
+      return res.status(400).json({
+        error:
+          "Expected completion date cannot be before the start date.",
+      });
+    }
+
+    if (
+      estimatedCost === null ||
+      estimatedCost < 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Estimated cost must be zero or greater.",
+      });
+    }
+
+    if (
+      serviceOdometer === null ||
+      serviceOdometer < vehicle.odometer
+    ) {
+      return res.status(400).json({
+        error: `Service odometer cannot be below the current vehicle reading of ${vehicle.odometer}.`,
+      });
+    }
+
+    try {
+      const log =
+        OperationsService.startMaintenance(
+          {
+            vehicle_id: vehicle.id,
+            maintenance_type:
+              body.maintenance_type,
+            description,
+            service_provider:
+              serviceProvider,
+            start_date: body.start_date,
+            expected_completion_date:
+              body.expected_completion_date,
+            estimated_cost: estimatedCost,
+            odometer_at_service:
+              serviceOdometer,
+          },
+          {
+            id: req.user!.id,
+            name: req.user!.full_name,
+          },
+        );
+
+      return res.status(201).json(
+        serializeMaintenanceRecord(log),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Maintenance could not be started.";
+
+      return res.status(409).json({
+        error: message,
+      });
+    }
+  },
+);
+
+apiRouter.post(
+  "/maintenance/:id/complete",
+  authenticateJWT,
+  requireRole(MAINTENANCE_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const body = req.body ?? {};
+    const actualCost = parseFiniteNumber(
+      body.actual_cost,
+    );
+    const notes =
+      typeof body.notes === "string"
+        ? body.notes.trim()
+        : "";
+
+    if (
+      actualCost === null ||
+      actualCost < 0
+    ) {
+      return res.status(400).json({
+        error:
+          "Actual cost must be zero or greater.",
+      });
+    }
+
+    if (!isIsoDate(body.completed_date)) {
+      return res.status(400).json({
+        error:
+          "Completed date must be a valid date.",
+      });
+    }
+
+    if (notes.length > 500) {
+      return res.status(400).json({
+        error:
+          "Completion notes cannot exceed 500 characters.",
+      });
+    }
+
+    try {
+      const log =
+        OperationsService.completeMaintenance(
+          req.params.id,
+          {
+            actual_cost: actualCost,
+            completed_date:
+              body.completed_date,
+            notes,
+          },
+          {
+            id: req.user!.id,
+            name: req.user!.full_name,
+          },
+        );
+
+      return res.json(
+        serializeMaintenanceRecord(log),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Maintenance could not be completed.";
+
+      return res.status(409).json({
+        error: message,
+      });
+    }
+  },
+);
+
+apiRouter.post(
+  "/maintenance/:id/cancel",
+  authenticateJWT,
+  requireRole(MAINTENANCE_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    try {
+      const log =
+        OperationsService.cancelMaintenance(
+          req.params.id,
+          {
+            id: req.user!.id,
+            name: req.user!.full_name,
+          },
+        );
+
+      return res.json(
+        serializeMaintenanceRecord(log),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Maintenance could not be cancelled.";
+
+      return res.status(409).json({
+        error: message,
+      });
+    }
+  },
+);
+
+apiRouter.delete(
+  "/maintenance/:id",
+  authenticateJWT,
+  requireRole([UserRole.ADMIN]),
+  (req: AuthenticatedRequest, res) => {
+    const index =
+      db.maintenance_logs.findIndex(
+        (log) => log.id === req.params.id,
+      );
+
+    if (index === -1) {
+      return res.status(404).json({
+        error:
+          "Maintenance record not found.",
+      });
+    }
+
+    const log = db.maintenance_logs[index];
+
+    if (
+      log.status !==
+      MaintenanceStatus.CANCELLED
+    ) {
+      return res.status(409).json({
+        error:
+          "Only cancelled maintenance records can be permanently deleted.",
+      });
+    }
+
+    const receiptNumber = `MNT-${log.id.toUpperCase()}`;
+    const linkedExpense = db.expenses.find(
+      (expense) =>
+        expense.receipt_number === receiptNumber,
+    );
+
+    if (linkedExpense) {
+      return res.status(409).json({
+        error:
+          "This maintenance record has a linked expense and cannot be deleted.",
+      });
+    }
+
+    db.maintenance_logs.splice(index, 1);
+
+    try {
+      db.save();
+    } catch (error) {
+      db.maintenance_logs.splice(
+        index,
+        0,
+        log,
+      );
+      throw error;
+    }
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Deleted cancelled maintenance record ${log.id}`,
+      "MAINTENANCE",
+      log.id,
+    );
+
+    return res.json({
+      success: true,
+    });
+  },
+);
 
 // ============================================================================
 // 7. FUEL LOGS & EXPENSE MODULE ENDPOINTS

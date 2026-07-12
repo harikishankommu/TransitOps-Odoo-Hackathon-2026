@@ -462,8 +462,29 @@ export class OperationsService {
     return trip;
   }
 
+  private static isIsoDate(
+    value: string,
+  ): boolean {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return false;
+    }
+
+    const [year, month, day] = value
+      .split("-")
+      .map(Number);
+    const date = new Date(
+      Date.UTC(year, month - 1, day),
+    );
+
+    return (
+      date.getUTCFullYear() === year &&
+      date.getUTCMonth() === month - 1 &&
+      date.getUTCDate() === day
+    );
+  }
+
   /**
-   * Starts a vehicle maintenance record
+   * Starts a maintenance workflow and marks the vehicle IN_SHOP.
    */
   public static startMaintenance(
     logData: {
@@ -476,70 +497,182 @@ export class OperationsService {
       estimated_cost: number;
       odometer_at_service: number;
     },
-    operator: { id: string; name: string }
+    operator: { id: string; name: string },
   ): MaintenanceLog {
-    const vehicle = db.vehicles.find(v => v.id === logData.vehicle_id);
+    const vehicle = db.vehicles.find(
+      (candidate) =>
+        candidate.id === logData.vehicle_id,
+    );
+
     if (!vehicle) {
       throw new Error("Vehicle not found.");
     }
 
-    if (vehicle.status === VehicleStatus.ON_TRIP) {
-      throw new Error("Maintenance cannot be started while the vehicle is on a trip.");
+    if (vehicle.status !== VehicleStatus.AVAILABLE) {
+      const reason =
+        vehicle.status === VehicleStatus.ON_TRIP
+          ? "currently on a trip"
+          : vehicle.status === VehicleStatus.IN_SHOP
+            ? "already in maintenance"
+            : "retired";
+
+      throw new Error(
+        `Maintenance cannot start because the vehicle is ${reason}.`,
+      );
     }
 
-    if (vehicle.status === VehicleStatus.RETIRED) {
-      throw new Error("Selected vehicle has been retired.");
-    }
-
-    const oldVehicleStatus = vehicle.status;
-
-    try {
-      // 1. Update vehicle status to IN_SHOP
-      vehicle.status = VehicleStatus.IN_SHOP;
-      vehicle.updated_at = new Date().toISOString();
-
-      // 2. Create Maintenance Log
-      const logId = "ml_" + Math.random().toString(36).substr(2, 9);
-      const log: MaintenanceLog = {
-        id: logId,
-        vehicle_id: vehicle.id,
-        maintenance_type: logData.maintenance_type,
-        description: logData.description,
-        service_provider: logData.service_provider,
-        start_date: logData.start_date,
-        expected_completion_date: logData.expected_completion_date,
-        estimated_cost: logData.estimated_cost,
-        odometer_at_service: logData.odometer_at_service,
-        status: MaintenanceStatus.IN_PROGRESS,
-        created_by: operator.id,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      };
-
-      db.maintenance_logs.unshift(log);
-      db.save();
-
-      // 3. Log Activity
-      db.logActivity(
-        operator.id,
-        operator.name,
-        `Opened maintenance service for vehicle ${vehicle.registration_number}`,
-        "MAINTENANCE",
-        log.id,
-        oldVehicleStatus,
-        VehicleStatus.IN_SHOP
+    const duplicateActiveRecord =
+      db.maintenance_logs.find(
+        (log) =>
+          log.vehicle_id === vehicle.id &&
+          [
+            MaintenanceStatus.OPEN,
+            MaintenanceStatus.IN_PROGRESS,
+          ].includes(log.status),
       );
 
-      return log;
-    } catch (err) {
-      vehicle.status = oldVehicleStatus;
-      db.save();
-      throw err;
+    if (duplicateActiveRecord) {
+      throw new Error(
+        "This vehicle already has an active maintenance record.",
+      );
     }
+
+    if (
+      !Object.values(MaintenanceType).includes(
+        logData.maintenance_type,
+      )
+    ) {
+      throw new Error(
+        "A valid maintenance type is required.",
+      );
+    }
+
+    if (
+      logData.description.trim().length < 3 ||
+      logData.description.trim().length > 500
+    ) {
+      throw new Error(
+        "Description must contain between 3 and 500 characters.",
+      );
+    }
+
+    if (
+      logData.service_provider.trim().length < 2 ||
+      logData.service_provider.trim().length > 100
+    ) {
+      throw new Error(
+        "Service provider must contain between 2 and 100 characters.",
+      );
+    }
+
+    if (
+      !this.isIsoDate(logData.start_date) ||
+      !this.isIsoDate(
+        logData.expected_completion_date,
+      )
+    ) {
+      throw new Error(
+        "Start and expected completion dates must be valid dates.",
+      );
+    }
+
+    if (
+      logData.expected_completion_date <
+      logData.start_date
+    ) {
+      throw new Error(
+        "Expected completion date cannot be before the start date.",
+      );
+    }
+
+    if (
+      !Number.isFinite(logData.estimated_cost) ||
+      logData.estimated_cost < 0
+    ) {
+      throw new Error(
+        "Estimated cost must be zero or greater.",
+      );
+    }
+
+    if (
+      !Number.isFinite(
+        logData.odometer_at_service,
+      ) ||
+      logData.odometer_at_service <
+        vehicle.odometer
+    ) {
+      throw new Error(
+        `Service odometer cannot be below the current vehicle reading of ${vehicle.odometer}.`,
+      );
+    }
+
+    const oldVehicle = { ...vehicle };
+    const now = new Date().toISOString();
+    const log: MaintenanceLog = {
+      id: db.generateId("ml"),
+      vehicle_id: vehicle.id,
+      maintenance_type:
+        logData.maintenance_type,
+      description: logData.description
+        .trim()
+        .replace(/\s+/g, " "),
+      service_provider:
+        logData.service_provider
+          .trim()
+          .replace(/\s+/g, " "),
+      start_date: logData.start_date,
+      expected_completion_date:
+        logData.expected_completion_date,
+      estimated_cost: logData.estimated_cost,
+      odometer_at_service:
+        logData.odometer_at_service,
+      status: MaintenanceStatus.IN_PROGRESS,
+      created_by: operator.id,
+      created_at: now,
+      updated_at: now,
+    };
+
+    vehicle.status = VehicleStatus.IN_SHOP;
+    vehicle.updated_at = now;
+    db.maintenance_logs.unshift(log);
+
+    try {
+      db.save();
+    } catch (error) {
+      Object.assign(vehicle, oldVehicle);
+
+      const logIndex =
+        db.maintenance_logs.findIndex(
+          (candidate) =>
+            candidate.id === log.id,
+        );
+
+      if (logIndex >= 0) {
+        db.maintenance_logs.splice(
+          logIndex,
+          1,
+        );
+      }
+
+      throw error;
+    }
+
+    db.logActivity(
+      operator.id,
+      operator.name,
+      `Started ${log.maintenance_type} for vehicle ${vehicle.registration_number}`,
+      "MAINTENANCE",
+      log.id,
+      oldVehicle.status,
+      VehicleStatus.IN_SHOP,
+    );
+
+    return log;
   }
 
   /**
-   * Completes a vehicle maintenance record
+   * Completes an active maintenance workflow, creates its expense,
+   * and returns the vehicle to AVAILABLE.
    */
   public static completeMaintenance(
     logId: string,
@@ -548,124 +681,228 @@ export class OperationsService {
       completed_date: string;
       notes?: string;
     },
-    operator: { id: string; name: string }
+    operator: { id: string; name: string },
   ): MaintenanceLog {
-    const log = db.maintenance_logs.find(m => m.id === logId);
+    const log = db.maintenance_logs.find(
+      (candidate) => candidate.id === logId,
+    );
+
     if (!log) {
-      throw new Error("Maintenance log not found.");
-    }
-    if (log.status !== MaintenanceStatus.IN_PROGRESS && log.status !== MaintenanceStatus.OPEN) {
-      throw new Error(`Cannot complete maintenance that is currently ${log.status}.`);
-    }
-
-    if (completionData.actual_cost < 0) {
-      throw new Error("Actual cost cannot be negative.");
+      throw new Error(
+        "Maintenance record not found.",
+      );
     }
 
-    const vehicle = db.vehicles.find(v => v.id === log.vehicle_id);
-    const oldLogStatus = log.status;
-    const oldVehicleStatus = vehicle?.status;
+    if (
+      ![
+        MaintenanceStatus.OPEN,
+        MaintenanceStatus.IN_PROGRESS,
+      ].includes(log.status)
+    ) {
+      throw new Error(
+        `Only active maintenance can be completed. Current status: ${log.status}.`,
+      );
+    }
+
+    if (
+      !Number.isFinite(
+        completionData.actual_cost,
+      ) ||
+      completionData.actual_cost < 0
+    ) {
+      throw new Error(
+        "Actual cost must be zero or greater.",
+      );
+    }
+
+    if (
+      !this.isIsoDate(
+        completionData.completed_date,
+      )
+    ) {
+      throw new Error(
+        "Completed date must be a valid date.",
+      );
+    }
+
+    if (
+      completionData.completed_date <
+      log.start_date
+    ) {
+      throw new Error(
+        "Completed date cannot be before the maintenance start date.",
+      );
+    }
+
+    const vehicle = db.vehicles.find(
+      (candidate) =>
+        candidate.id === log.vehicle_id,
+    );
+
+    if (!vehicle) {
+      throw new Error(
+        "The vehicle linked to this maintenance record was not found.",
+      );
+    }
+
+    if (vehicle.status !== VehicleStatus.IN_SHOP) {
+      throw new Error(
+        "The linked vehicle is not currently IN_SHOP.",
+      );
+    }
+
+    const oldLog = { ...log };
+    const oldVehicle = { ...vehicle };
+    const now = new Date().toISOString();
+    const notes =
+      completionData.notes?.trim() ?? "";
+    const receiptNumber = `MNT-${log.id.toUpperCase()}`;
+    const existingExpense = db.expenses.find(
+      (expense) =>
+        expense.receipt_number === receiptNumber,
+    );
+
+    if (existingExpense) {
+      throw new Error(
+        "A maintenance expense already exists for this record.",
+      );
+    }
+
+    const expense: Expense = {
+      id: db.generateId("ex"),
+      vehicle_id: vehicle.id,
+      expense_type: ExpenseType.MAINTENANCE,
+      amount: completionData.actual_cost,
+      expense_date:
+        completionData.completed_date,
+      description: `Maintenance completed: ${log.maintenance_type} — ${log.description}`,
+      receipt_number: receiptNumber,
+      created_by: operator.id,
+      created_at: now,
+      updated_at: now,
+    };
+
+    log.status = MaintenanceStatus.COMPLETED;
+    log.actual_cost =
+      completionData.actual_cost;
+    log.completed_date =
+      completionData.completed_date;
+    log.description = notes
+      ? `${log.description}\n[Completion Notes] ${notes}`
+      : log.description;
+    log.updated_at = now;
+
+    vehicle.status = VehicleStatus.AVAILABLE;
+    vehicle.updated_at = now;
+    db.expenses.unshift(expense);
 
     try {
-      // 1. Update Maintenance Log
-      log.status = MaintenanceStatus.COMPLETED;
-      log.actual_cost = completionData.actual_cost;
-      log.completed_date = completionData.completed_date;
-      if (completionData.notes) {
-        log.description += `\n[Completion Notes]: ${completionData.notes}`;
-      }
-      log.updated_at = new Date().toISOString();
-
-      // 2. Update Vehicle status to AVAILABLE (unless RETIRED)
-      if (vehicle) {
-        if (vehicle.status !== VehicleStatus.RETIRED) {
-          vehicle.status = VehicleStatus.AVAILABLE;
-          vehicle.updated_at = new Date().toISOString();
-        }
-      }
-
-      // 3. Log an Expense for this maintenance
-      const expense: Expense = {
-        id: "ex_" + Math.random().toString(36).substr(2, 9),
-        vehicle_id: log.vehicle_id,
-        expense_type: ExpenseType.MAINTENANCE,
-        amount: completionData.actual_cost,
-        expense_date: completionData.completed_date,
-        description: `Maintenance complete: ${log.maintenance_type} - ${log.description}`,
-        receipt_number: "MNT-" + log.id.toUpperCase(),
-        created_by: operator.id,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      };
-      db.expenses.unshift(expense);
-
       db.save();
+    } catch (error) {
+      Object.assign(log, oldLog);
+      Object.assign(vehicle, oldVehicle);
 
-      // 4. Log Activity
-      db.logActivity(
-        operator.id,
-        operator.name,
-        `Completed maintenance for vehicle ${vehicle?.registration_number || ""}`,
-        "MAINTENANCE",
-        log.id,
-        oldLogStatus,
-        MaintenanceStatus.COMPLETED
-      );
+      const expenseIndex =
+        db.expenses.findIndex(
+          (candidate) =>
+            candidate.id === expense.id,
+        );
 
-      return log;
-    } catch (err) {
-      log.status = oldLogStatus;
-      log.actual_cost = undefined;
-      log.completed_date = undefined;
-      if (vehicle && oldVehicleStatus) vehicle.status = oldVehicleStatus;
-      db.save();
-      throw err;
+      if (expenseIndex >= 0) {
+        db.expenses.splice(
+          expenseIndex,
+          1,
+        );
+      }
+
+      throw error;
     }
+
+    db.logActivity(
+      operator.id,
+      operator.name,
+      `Completed maintenance for vehicle ${vehicle.registration_number}`,
+      "MAINTENANCE",
+      log.id,
+      oldLog.status,
+      MaintenanceStatus.COMPLETED,
+    );
+
+    return log;
   }
 
   /**
-   * Cancels a vehicle maintenance record
+   * Cancels active maintenance and releases the vehicle.
    */
-  public static cancelMaintenance(logId: string, operator: { id: string; name: string }): MaintenanceLog {
-    const log = db.maintenance_logs.find(m => m.id === logId);
+  public static cancelMaintenance(
+    logId: string,
+    operator: { id: string; name: string },
+  ): MaintenanceLog {
+    const log = db.maintenance_logs.find(
+      (candidate) => candidate.id === logId,
+    );
+
     if (!log) {
-      throw new Error("Maintenance log not found.");
-    }
-    if (log.status === MaintenanceStatus.COMPLETED || log.status === MaintenanceStatus.CANCELLED) {
-      throw new Error(`Cannot cancel a maintenance record that is already ${log.status}.`);
+      throw new Error(
+        "Maintenance record not found.",
+      );
     }
 
-    const vehicle = db.vehicles.find(v => v.id === log.vehicle_id);
-    const oldLogStatus = log.status;
-    const oldVehicleStatus = vehicle?.status;
+    if (
+      ![
+        MaintenanceStatus.OPEN,
+        MaintenanceStatus.IN_PROGRESS,
+      ].includes(log.status)
+    ) {
+      throw new Error(
+        `Only active maintenance can be cancelled. Current status: ${log.status}.`,
+      );
+    }
+
+    const vehicle = db.vehicles.find(
+      (candidate) =>
+        candidate.id === log.vehicle_id,
+    );
+
+    if (!vehicle) {
+      throw new Error(
+        "The vehicle linked to this maintenance record was not found.",
+      );
+    }
+
+    if (vehicle.status !== VehicleStatus.IN_SHOP) {
+      throw new Error(
+        "The linked vehicle is not currently IN_SHOP.",
+      );
+    }
+
+    const oldLog = { ...log };
+    const oldVehicle = { ...vehicle };
+    const now = new Date().toISOString();
+
+    log.status = MaintenanceStatus.CANCELLED;
+    log.updated_at = now;
+    vehicle.status = VehicleStatus.AVAILABLE;
+    vehicle.updated_at = now;
 
     try {
-      log.status = MaintenanceStatus.CANCELLED;
-      log.updated_at = new Date().toISOString();
-
-      if (vehicle && vehicle.status === VehicleStatus.IN_SHOP) {
-        vehicle.status = VehicleStatus.AVAILABLE;
-        vehicle.updated_at = new Date().toISOString();
-      }
-
       db.save();
-
-      db.logActivity(
-        operator.id,
-        operator.name,
-        `Cancelled maintenance for vehicle ${vehicle?.registration_number || ""}`,
-        "MAINTENANCE",
-        log.id,
-        oldLogStatus,
-        MaintenanceStatus.CANCELLED
-      );
-
-      return log;
-    } catch (err) {
-      log.status = oldLogStatus;
-      if (vehicle && oldVehicleStatus) vehicle.status = oldVehicleStatus;
-      db.save();
-      throw err;
+    } catch (error) {
+      Object.assign(log, oldLog);
+      Object.assign(vehicle, oldVehicle);
+      throw error;
     }
+
+    db.logActivity(
+      operator.id,
+      operator.name,
+      `Cancelled maintenance for vehicle ${vehicle.registration_number}`,
+      "MAINTENANCE",
+      log.id,
+      oldLog.status,
+      MaintenanceStatus.CANCELLED,
+    );
+
+    return log;
   }
 }
