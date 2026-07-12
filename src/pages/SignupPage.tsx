@@ -31,8 +31,8 @@ export const SignupPage: React.FC<SignupPageProps> = ({ onLoginClick }) => {
       setError("Passwords do not match.");
       return;
     }
-    if (password.length < 6) {
-      setError("Password must be at least 6 characters.");
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters.");
       return;
     }
 
@@ -105,7 +105,7 @@ export const SignupPage: React.FC<SignupPageProps> = ({ onLoginClick }) => {
 
           <div>
             <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">
-              Password (Min 6 chars)
+              Password (Min 8 chars)
             </label>
             <input
               type="password"

@@ -1,8 +1,9 @@
-import { Router, Response } from "express";
+import { Router } from "express";
 import { db } from "../database.js";
 import { Security, authenticateJWT, requireRole, AuthenticatedRequest } from "../utils/auth.js";
 import { OperationsService } from "../services/operations.js";
 import {
+  User,
   UserRole,
   VehicleStatus,
   VehicleType,
@@ -18,220 +19,479 @@ import {
   Trip,
   MaintenanceLog,
   FuelLog,
-  Expense
+  Expense,
 } from "../../types.js";
 
 const apiRouter = Router();
 
+const EMAIL_PATTERN =
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function serializeManagedUser(user: User) {
+  return {
+    ...Security.serializeUser(user),
+    created_at: user.created_at,
+    updated_at: user.updated_at,
+  };
+}
+
+function countActiveAdmins(): number {
+  return db.users.filter(
+    (user) =>
+      user.role === UserRole.ADMIN &&
+      user.is_active,
+  ).length;
+}
 // ============================================================================
 // 1. AUTHENTICATION ENDPOINTS
 // ============================================================================
 
 apiRouter.post("/auth/signup", (req, res) => {
-  const { full_name, email, password, confirm_password } = req.body;
+  const {
+    full_name,
+    email,
+    password,
+    confirm_password,
+  } = req.body ?? {};
 
-  if (!full_name || !email || !password || !confirm_password) {
-    return res.status(400).json({ error: "All fields are required." });
+  if (
+    typeof full_name !== "string" ||
+    typeof email !== "string" ||
+    typeof password !== "string" ||
+    typeof confirm_password !== "string"
+  ) {
+    return res.status(400).json({
+      error: "All signup fields are required.",
+    });
+  }
+
+  const normalizedName = full_name.trim();
+  const normalizedEmail = normalizeEmail(email);
+
+  if (
+    normalizedName.length < 2 ||
+    normalizedName.length > 80
+  ) {
+    return res.status(400).json({
+      error:
+        "Full name must contain between 2 and 80 characters.",
+    });
+  }
+
+  if (
+    normalizedEmail.length > 254 ||
+    !EMAIL_PATTERN.test(normalizedEmail)
+  ) {
+    return res.status(400).json({
+      error: "Enter a valid email address.",
+    });
+  }
+
+  if (
+    password.length < 8 ||
+    password.length > 128
+  ) {
+    return res.status(400).json({
+      error:
+        "Password must contain between 8 and 128 characters.",
+    });
   }
 
   if (password !== confirm_password) {
-    return res.status(400).json({ error: "Passwords do not match." });
+    return res.status(400).json({
+      error: "Passwords do not match.",
+    });
   }
 
-  const existing = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
-  if (existing) {
-    return res.status(400).json({ error: "Email already registered." });
+  const existingUser = db.users.find(
+    (user) =>
+      normalizeEmail(user.email) === normalizedEmail,
+  );
+
+  if (existingUser) {
+    return res.status(409).json({
+      error:
+        "An account with this email address already exists.",
+    });
   }
 
-  // Create new user - signup defaults to DRIVER role
-  const newUser = {
-    id: "usr_" + Math.random().toString(36).substr(2, 9),
-    full_name,
-    email: email.toLowerCase(),
-    password_hash: Security.hashPassword(password),
-    role: UserRole.DRIVER, // strict requirement: default to Driver/Employee, no self-assigned Admin
+  const now = new Date().toISOString();
+
+  const newUser: User = {
+    id: db.generateId("usr"),
+    full_name: normalizedName,
+    email: normalizedEmail,
+    password_hash:
+      Security.hashPassword(password),
+
+    // Users cannot select or elevate their role at signup.
+    role: UserRole.DRIVER,
+
     is_active: true,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
+    created_at: now,
+    updated_at: now,
   };
 
   db.users.push(newUser);
-  db.save();
 
-  // If role is driver, automatically create a basic driver profile
-  const newDriver: Driver = {
-    id: "dr_" + Math.random().toString(36).substr(2, 9),
-    user_id: newUser.id,
-    full_name: newUser.full_name,
-    licence_number: "PENDING-" + newUser.id.substr(4, 4).toUpperCase(),
-    licence_category: "Light Motor Vehicle",
-    licence_expiry_date: new Date(Date.now() + 365 * 86400000).toISOString().split("T")[0], // valid 1 year
-    contact_number: "0000000000",
-    safety_score: 100,
-    region: "Patna",
-    status: DriverStatus.AVAILABLE,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
-  db.drivers.push(newDriver);
-  db.save();
+  try {
+    db.save();
+  } catch (error) {
+    const newUserIndex = db.users.findIndex(
+      (user) => user.id === newUser.id,
+    );
+
+    if (newUserIndex >= 0) {
+      db.users.splice(newUserIndex, 1);
+    }
+
+    throw error;
+  }
 
   db.logActivity(
     newUser.id,
     newUser.full_name,
-    `Registered a new account with Driver profile`,
+    "Registered a new account",
     "USER",
-    newUser.id
+    newUser.id,
   );
 
   const token = Security.generateToken(newUser);
-  res.status(201).json({
+
+  return res.status(201).json({
     token,
-    user: {
-      id: newUser.id,
-      full_name: newUser.full_name,
-      email: newUser.email,
-      role: newUser.role
-    }
+    user: Security.serializeUser(newUser),
   });
 });
 
 apiRouter.post("/auth/login", (req, res) => {
-  const { email, password } = req.body;
+  const { email, password } = req.body ?? {};
 
-  if (!email || !password) {
-    return res.status(400).json({ error: "Email and password are required." });
+  if (
+    typeof email !== "string" ||
+    typeof password !== "string" ||
+    !email.trim() ||
+    !password
+  ) {
+    return res.status(400).json({
+      error:
+        "Email and password are required.",
+    });
   }
 
-  const user = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
-  if (!user || !Security.comparePassword(password, user.password_hash)) {
-    return res.status(401).json({ error: "Invalid email or password." });
+  const normalizedEmail = normalizeEmail(email);
+
+  const user = db.users.find(
+    (candidate) =>
+      normalizeEmail(candidate.email) ===
+      normalizedEmail,
+  );
+
+  if (
+    !user ||
+    !Security.comparePassword(
+      password,
+      user.password_hash,
+    )
+  ) {
+    return res.status(401).json({
+      error: "Invalid email or password.",
+    });
   }
 
   if (!user.is_active) {
-    return res.status(403).json({ error: "Your account has been disabled. Please contact Admin." });
+    return res.status(403).json({
+      error:
+        "Your account is disabled. Please contact an administrator.",
+    });
   }
 
   const token = Security.generateToken(user);
 
-  db.logActivity(user.id, user.full_name, "Logged in successfully", "USER", user.id);
+  db.logActivity(
+    user.id,
+    user.full_name,
+    "Logged in successfully",
+    "USER",
+    user.id,
+  );
 
-  res.json({
+  return res.json({
     token,
-    user: {
-      id: user.id,
-      full_name: user.full_name,
-      email: user.email,
-      role: user.role
+    user: Security.serializeUser(user),
+  });
+});
+
+apiRouter.get(
+  "/auth/me",
+  authenticateJWT,
+  (req: AuthenticatedRequest, res) => {
+    if (!req.user) {
+      return res.status(401).json({
+        error: "Authentication is required.",
+      });
     }
-  });
-});
 
-apiRouter.get("/auth/me", authenticateJWT, (req: AuthenticatedRequest, res) => {
-  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-  res.json({
-    id: req.user.id,
-    full_name: req.user.full_name,
-    email: req.user.email,
-    role: req.user.role,
-    is_active: req.user.is_active
-  });
-});
+    return res.json(
+      Security.serializeUser(req.user),
+    );
+  },
+);
 
-apiRouter.post("/auth/logout", authenticateJWT, (req: AuthenticatedRequest, res) => {
-  if (req.user) {
-    db.logActivity(req.user.id, req.user.full_name, "Logged out", "USER", req.user.id);
-  }
-  res.json({ success: true });
-});
+apiRouter.post(
+  "/auth/logout",
+  authenticateJWT,
+  (req: AuthenticatedRequest, res) => {
+    if (req.user) {
+      db.logActivity(
+        req.user.id,
+        req.user.full_name,
+        "Logged out",
+        "USER",
+        req.user.id,
+      );
+    }
 
+    return res.json({
+      success: true,
+    });
+  },
+);
+
+const VEHICLE_READ_ROLES = [
+  UserRole.ADMIN,
+  UserRole.FLEET_MANAGER,
+  UserRole.DISPATCHER,
+];
+
+const DRIVER_READ_ROLES = [
+  UserRole.ADMIN,
+  UserRole.DISPATCHER,
+  UserRole.SAFETY_OFFICER,
+];
+
+const TRIP_READ_ROLES = [
+  UserRole.ADMIN,
+  UserRole.DISPATCHER,
+  UserRole.DRIVER,
+];
+
+const MAINTENANCE_ROLES = [
+  UserRole.ADMIN,
+  UserRole.FLEET_MANAGER,
+];
+
+const FINANCIAL_ROLES = [
+  UserRole.ADMIN,
+  UserRole.FLEET_MANAGER,
+  UserRole.FINANCIAL_ANALYST,
+];
+
+const REPORT_ROLES = [
+  UserRole.ADMIN,
+  UserRole.FLEET_MANAGER,
+  UserRole.SAFETY_OFFICER,
+  UserRole.FINANCIAL_ANALYST,
+];
 
 // ============================================================================
 // 2. USER ENDPOINTS
 // ============================================================================
 
-apiRouter.get("/users", authenticateJWT, requireRole([UserRole.ADMIN]), (req, res) => {
-  // admin views all users
-  const result = db.users.map(u => ({
-    id: u.id,
-    full_name: u.full_name,
-    email: u.email,
-    role: u.role,
-    is_active: u.is_active,
-    created_at: u.created_at
-  }));
-  res.json(result);
-});
+apiRouter.get(
+  "/users",
+  authenticateJWT,
+  requireRole([UserRole.ADMIN]),
+  (_req, res) => {
+    const users = db.users.map(
+      serializeManagedUser,
+    );
 
-apiRouter.patch("/users/:id/role", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
-  const { role } = req.body;
-  if (!role || !Object.values(UserRole).includes(role)) {
-    return res.status(400).json({ error: "Invalid role specified." });
-  }
+    return res.json(users);
+  },
+);
 
-  const targetUser = db.users.find(u => u.id === req.params.id);
-  if (!targetUser) return res.status(404).json({ error: "User not found." });
+apiRouter.get(
+  "/users/:id",
+  authenticateJWT,
+  requireRole([UserRole.ADMIN]),
+  (req, res) => {
+    const targetUser = db.users.find(
+      (user) => user.id === req.params.id,
+    );
 
-  if (targetUser.id === req.user?.id) {
-    return res.status(400).json({ error: "You cannot change your own role." });
-  }
+    if (!targetUser) {
+      return res.status(404).json({
+        error: "User not found.",
+      });
+    }
 
-  const oldRole = targetUser.role;
-  targetUser.role = role;
-  targetUser.updated_at = new Date().toISOString();
-  db.save();
+    return res.json(
+      serializeManagedUser(targetUser),
+    );
+  },
+);
 
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Changed user ${targetUser.full_name}'s role`,
-    "USER",
-    targetUser.id,
-    oldRole,
-    role
-  );
+apiRouter.patch(
+  "/users/:id/role",
+  authenticateJWT,
+  requireRole([UserRole.ADMIN]),
+  (req: AuthenticatedRequest, res) => {
+    const { role } = req.body ?? {};
 
-  res.json({ success: true, user: targetUser });
-});
+    if (
+      typeof role !== "string" ||
+      !Object.values(UserRole).includes(
+        role as UserRole,
+      )
+    ) {
+      return res.status(400).json({
+        error: "A valid role is required.",
+      });
+    }
 
-apiRouter.patch("/users/:id/status", authenticateJWT, requireRole([UserRole.ADMIN]), (req: AuthenticatedRequest, res) => {
-  const { is_active } = req.body;
-  if (is_active === undefined) {
-    return res.status(400).json({ error: "is_active is required." });
-  }
+    const requestedRole = role as UserRole;
 
-  const targetUser = db.users.find(u => u.id === req.params.id);
-  if (!targetUser) return res.status(404).json({ error: "User not found." });
+    const targetUser = db.users.find(
+      (user) => user.id === req.params.id,
+    );
 
-  if (targetUser.id === req.user?.id) {
-    return res.status(400).json({ error: "You cannot disable your own account." });
-  }
+    if (!targetUser) {
+      return res.status(404).json({
+        error: "User not found.",
+      });
+    }
 
-  const oldStatus = targetUser.is_active ? "ACTIVE" : "DISABLED";
-  targetUser.is_active = !!is_active;
-  targetUser.updated_at = new Date().toISOString();
-  db.save();
+    if (targetUser.id === req.user?.id) {
+      return res.status(400).json({
+        error:
+          "You cannot change your own role.",
+      });
+    }
 
-  const newStatus = targetUser.is_active ? "ACTIVE" : "DISABLED";
-  db.logActivity(
-    req.user!.id,
-    req.user!.full_name,
-    `Changed user ${targetUser.full_name}'s status`,
-    "USER",
-    targetUser.id,
-    oldStatus,
-    newStatus
-  );
+    if (
+      targetUser.role === UserRole.ADMIN &&
+      requestedRole !== UserRole.ADMIN &&
+      targetUser.is_active &&
+      countActiveAdmins() <= 1
+    ) {
+      return res.status(409).json({
+        error:
+          "The final active administrator cannot be demoted.",
+      });
+    }
 
-  res.json({ success: true, user: targetUser });
-});
+    const oldRole = targetUser.role;
 
+    targetUser.role = requestedRole;
+    targetUser.updated_at =
+      new Date().toISOString();
 
+    db.save();
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Changed ${targetUser.full_name}'s role`,
+      "USER",
+      targetUser.id,
+      oldRole,
+      requestedRole,
+    );
+
+    return res.json({
+      success: true,
+      user: serializeManagedUser(targetUser),
+    });
+  },
+);
+
+apiRouter.patch(
+  "/users/:id/status",
+  authenticateJWT,
+  requireRole([UserRole.ADMIN]),
+  (req: AuthenticatedRequest, res) => {
+    const { is_active } = req.body ?? {};
+
+    if (typeof is_active !== "boolean") {
+      return res.status(400).json({
+        error:
+          "is_active must be either true or false.",
+      });
+    }
+
+    const targetUser = db.users.find(
+      (user) => user.id === req.params.id,
+    );
+
+    if (!targetUser) {
+      return res.status(404).json({
+        error: "User not found.",
+      });
+    }
+
+    if (targetUser.id === req.user?.id) {
+      return res.status(400).json({
+        error:
+          "You cannot disable your own account.",
+      });
+    }
+
+    if (
+      targetUser.role === UserRole.ADMIN &&
+      targetUser.is_active &&
+      !is_active &&
+      countActiveAdmins() <= 1
+    ) {
+      return res.status(409).json({
+        error:
+          "The final active administrator cannot be disabled.",
+      });
+    }
+
+    const oldStatus = targetUser.is_active
+      ? "ACTIVE"
+      : "DISABLED";
+
+    targetUser.is_active = is_active;
+    targetUser.updated_at =
+      new Date().toISOString();
+
+    db.save();
+
+    const newStatus = targetUser.is_active
+      ? "ACTIVE"
+      : "DISABLED";
+
+    db.logActivity(
+      req.user!.id,
+      req.user!.full_name,
+      `Changed ${targetUser.full_name}'s account status`,
+      "USER",
+      targetUser.id,
+      oldStatus,
+      newStatus,
+    );
+
+    return res.json({
+      success: true,
+      user: serializeManagedUser(targetUser),
+    });
+  },
+);
 // ============================================================================
 // 3. VEHICLE MODULE ENDPOINTS
 // ============================================================================
 
-apiRouter.get("/vehicles/available", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/vehicles/available",
+  authenticateJWT,
+  requireRole(VEHICLE_READ_ROLES),
+  (req, res) => {
   // Vehicles that can be dispatched
   const result = db.vehicles.filter(
     v => v.status === VehicleStatus.AVAILABLE
@@ -239,7 +499,11 @@ apiRouter.get("/vehicles/available", authenticateJWT, (req, res) => {
   res.json(result);
 });
 
-apiRouter.get("/vehicles", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/vehicles",
+  authenticateJWT,
+  requireRole(VEHICLE_READ_ROLES),
+  (req, res) => {
   const { search, status, vehicle_type, region, sort_by, sort_order } = req.query;
 
   let list = [...db.vehicles];
@@ -298,13 +562,21 @@ apiRouter.get("/vehicles", authenticateJWT, (req, res) => {
   });
 });
 
-apiRouter.get("/vehicles/:id", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/vehicles/:id",
+  authenticateJWT,
+  requireRole(VEHICLE_READ_ROLES),
+  (req, res) => {
   const vehicle = db.vehicles.find(v => v.id === req.params.id);
   if (!vehicle) return res.status(404).json({ error: "Vehicle not found." });
   res.json(vehicle);
 });
 
-apiRouter.get("/vehicles/:id/history", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/vehicles/:id/history",
+  authenticateJWT,
+  requireRole(VEHICLE_READ_ROLES),
+  (req, res) => {
   const trips = db.trips.filter(t => t.vehicle_id === req.params.id);
   const maintenance = db.maintenance_logs.filter(m => m.vehicle_id === req.params.id);
   const expenses = db.expenses.filter(e => e.vehicle_id === req.params.id);
@@ -485,7 +757,11 @@ apiRouter.delete("/vehicles/:id", authenticateJWT, requireRole([UserRole.ADMIN])
 // 4. DRIVER MODULE ENDPOINTS
 // ============================================================================
 
-apiRouter.get("/drivers/available", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/drivers/available",
+  authenticateJWT,
+  requireRole(DRIVER_READ_ROLES),
+  (req, res) => {
   // available and licence is valid
   const todayStr = new Date().toISOString().split("T")[0];
   const list = db.drivers.filter(
@@ -494,7 +770,11 @@ apiRouter.get("/drivers/available", authenticateJWT, (req, res) => {
   res.json(list);
 });
 
-apiRouter.get("/drivers", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/drivers",
+  authenticateJWT,
+  requireRole(DRIVER_READ_ROLES),
+  (req, res) => {
   const { search, status, licence_status, region } = req.query;
 
   let list = [...db.drivers];
@@ -540,7 +820,11 @@ apiRouter.get("/drivers", authenticateJWT, (req, res) => {
   res.json(list);
 });
 
-apiRouter.get("/drivers/:id", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/drivers/:id",
+  authenticateJWT,
+  requireRole(DRIVER_READ_ROLES),
+  (req, res) => {
   const driver = db.drivers.find(d => d.id === req.params.id);
   if (!driver) return res.status(404).json({ error: "Driver not found." });
   res.json(driver);
@@ -730,7 +1014,11 @@ apiRouter.delete("/drivers/:id", authenticateJWT, requireRole([UserRole.ADMIN]),
 // 5. TRIP MODULE ENDPOINTS
 // ============================================================================
 
-apiRouter.get("/trips", authenticateJWT, (req: AuthenticatedRequest, res) => {
+apiRouter.get(
+  "/trips",
+  authenticateJWT,
+  requireRole(TRIP_READ_ROLES),
+  (req: AuthenticatedRequest, res) => {
   const { status, vehicle_id, driver_id, search } = req.query;
 
   let list = [...db.trips];
@@ -786,25 +1074,79 @@ apiRouter.get("/trips", authenticateJWT, (req: AuthenticatedRequest, res) => {
   res.json(result);
 });
 
-apiRouter.get("/trips/:id", authenticateJWT, (req, res) => {
-  const t = db.trips.find(trip => trip.id === req.params.id);
-  if (!t) return res.status(404).json({ error: "Trip not found." });
+apiRouter.get(
+  "/trips/:id",
+  authenticateJWT,
+  requireRole(TRIP_READ_ROLES),
+  (req: AuthenticatedRequest, res) => {
+    const trip = db.trips.find(
+      (candidate) =>
+        candidate.id === req.params.id,
+    );
 
-  const vehicle = db.vehicles.find(v => v.id === t.vehicle_id);
-  const driver = db.drivers.find(d => d.id === t.driver_id);
+    if (!trip) {
+      return res.status(404).json({
+        error: "Trip not found.",
+      });
+    }
 
-  res.json({
-    ...t,
-    vehicle_name: vehicle ? `${vehicle.vehicle_name} (${vehicle.registration_number})` : "Unknown Vehicle",
-    vehicle_capacity: vehicle?.maximum_load_capacity || 0,
-    vehicle_reg: vehicle?.registration_number,
-    driver_name: driver ? driver.full_name : "Unknown Driver",
-    driver_licence: driver?.licence_number,
-    driver_licence_expiry: driver?.licence_expiry_date,
-    driver_phone: driver?.contact_number,
-    driver_score: driver?.safety_score
-  });
-});
+    if (req.user?.role === UserRole.DRIVER) {
+      const driverProfile = db.drivers.find(
+        (driver) =>
+          driver.user_id === req.user?.id,
+      );
+
+      if (
+        !driverProfile ||
+        trip.driver_id !== driverProfile.id
+      ) {
+        return res.status(403).json({
+          error:
+            "You can only view trips assigned to your driver profile.",
+        });
+      }
+    }
+
+    const vehicle = db.vehicles.find(
+      (candidate) =>
+        candidate.id === trip.vehicle_id,
+    );
+
+    const driver = db.drivers.find(
+      (candidate) =>
+        candidate.id === trip.driver_id,
+    );
+
+    return res.json({
+      ...trip,
+
+      vehicle_name: vehicle
+        ? `${vehicle.vehicle_name} (${vehicle.registration_number})`
+        : "Unknown Vehicle",
+
+      vehicle_capacity:
+        vehicle?.maximum_load_capacity ?? 0,
+
+      vehicle_reg:
+        vehicle?.registration_number,
+
+      driver_name:
+        driver?.full_name ?? "Unknown Driver",
+
+      driver_licence:
+        driver?.licence_number,
+
+      driver_licence_expiry:
+        driver?.licence_expiry_date,
+
+      driver_phone:
+        driver?.contact_number,
+
+      driver_score:
+        driver?.safety_score,
+    });
+  },
+);
 
 apiRouter.post("/trips", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
   const {
@@ -985,31 +1327,103 @@ apiRouter.post("/trips/:id/dispatch", authenticateJWT, requireRole([UserRole.ADM
   }
 });
 
-apiRouter.post("/trips/:id/complete", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER, UserRole.DRIVER]), (req: AuthenticatedRequest, res) => {
-  try {
-    const { actual_distance, final_odometer, fuel_consumed, revenue, notes } = req.body;
+apiRouter.post(
+  "/trips/:id/complete",
+  authenticateJWT,
+  requireRole([
+    UserRole.ADMIN,
+    UserRole.DISPATCHER,
+    UserRole.DRIVER,
+  ]),
+  (req: AuthenticatedRequest, res) => {
+    try {
+      const existingTrip = db.trips.find(
+        (trip) => trip.id === req.params.id,
+      );
 
-    if (actual_distance === undefined || final_odometer === undefined || fuel_consumed === undefined) {
-      return res.status(400).json({ error: "Actual distance, final odometer, and fuel consumed are required to complete a trip." });
+      if (!existingTrip) {
+        return res.status(404).json({
+          error: "Trip not found.",
+        });
+      }
+
+      if (req.user?.role === UserRole.DRIVER) {
+        const driverProfile = db.drivers.find(
+          (driver) =>
+            driver.user_id === req.user?.id,
+        );
+
+        if (
+          !driverProfile ||
+          existingTrip.driver_id !==
+            driverProfile.id
+        ) {
+          return res.status(403).json({
+            error:
+              "You can only complete a trip assigned to your driver profile.",
+          });
+        }
+      }
+
+      const {
+        actual_distance,
+        final_odometer,
+        fuel_consumed,
+        revenue,
+        notes,
+      } = req.body ?? {};
+
+      if (
+        actual_distance === undefined ||
+        final_odometer === undefined ||
+        fuel_consumed === undefined
+      ) {
+        return res.status(400).json({
+          error:
+            "Actual distance, final odometer, and fuel consumed are required to complete a trip.",
+        });
+      }
+
+      const operator = {
+        id: req.user!.id,
+        name: req.user!.full_name,
+      };
+
+      const trip = OperationsService.completeTrip(
+        req.params.id,
+        {
+          actual_distance:
+            Number(actual_distance),
+
+          final_odometer:
+            Number(final_odometer),
+
+          fuel_consumed:
+            Number(fuel_consumed),
+
+          revenue:
+            revenue !== undefined
+              ? Number(revenue)
+              : undefined,
+
+          notes,
+        },
+        operator,
+      );
+
+      return res.json(trip);
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to complete the trip.";
+
+      return res.status(400).json({
+        error: message,
+      });
     }
-
-    const operator = { id: req.user!.id, name: req.user!.full_name };
-    const trip = OperationsService.completeTrip(
-      req.params.id,
-      {
-        actual_distance: Number(actual_distance),
-        final_odometer: Number(final_odometer),
-        fuel_consumed: Number(fuel_consumed),
-        revenue: revenue !== undefined ? Number(revenue) : undefined,
-        notes
-      },
-      operator
-    );
-    res.json(trip);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
+  },
+);
 
 apiRouter.post("/trips/:id/cancel", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.DISPATCHER]), (req: AuthenticatedRequest, res) => {
   try {
@@ -1026,7 +1440,11 @@ apiRouter.post("/trips/:id/cancel", authenticateJWT, requireRole([UserRole.ADMIN
 // 6. MAINTENANCE MODULE ENDPOINTS
 // ============================================================================
 
-apiRouter.get("/maintenance", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/maintenance",
+  authenticateJWT,
+  requireRole(MAINTENANCE_ROLES),
+  (req, res) => {
   const { status, vehicle_id } = req.query;
 
   let list = [...db.maintenance_logs];
@@ -1051,7 +1469,11 @@ apiRouter.get("/maintenance", authenticateJWT, (req, res) => {
   res.json(result);
 });
 
-apiRouter.get("/maintenance/:id", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/maintenance/:id",
+  authenticateJWT,
+  requireRole(MAINTENANCE_ROLES),
+  (req, res) => {
   const log = db.maintenance_logs.find(m => m.id === req.params.id);
   if (!log) return res.status(404).json({ error: "Maintenance log not found." });
 
@@ -1140,7 +1562,11 @@ apiRouter.post("/maintenance/:id/cancel", authenticateJWT, requireRole([UserRole
 // ============================================================================
 
 // Fuel Logs CRUD
-apiRouter.get(["/fuel-logs", "/fuel"], authenticateJWT, (req, res) => {
+apiRouter.get(
+  ["/fuel-logs", "/fuel"],
+  authenticateJWT,
+  requireRole(FINANCIAL_ROLES),
+  (req, res) => {
   const list = [...db.fuel_logs];
   // Denormalize vehicles
   let result = list.map(f => {
@@ -1171,7 +1597,11 @@ apiRouter.get(["/fuel-logs", "/fuel"], authenticateJWT, (req, res) => {
   res.json(result);
 });
 
-apiRouter.post(["/fuel-logs", "/fuel"], authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FLEET_MANAGER, UserRole.DRIVER, UserRole.FINANCIAL_ANALYST]), (req: AuthenticatedRequest, res) => {
+apiRouter.post(
+  ["/fuel-logs", "/fuel"],
+  authenticateJWT,
+  requireRole(FINANCIAL_ROLES),
+  (req: AuthenticatedRequest, res) => {
   const {
     vehicle_id,
     trip_id,
@@ -1283,7 +1713,11 @@ apiRouter.delete("/fuel-logs/:id", authenticateJWT, requireRole([UserRole.ADMIN]
 });
 
 // Expenses CRUD
-apiRouter.get("/expenses", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/expenses",
+  authenticateJWT,
+  requireRole(FINANCIAL_ROLES),
+  (req, res) => {
   const list = [...db.expenses];
   // Denormalize
   let result = list.map(e => {
@@ -1314,7 +1748,11 @@ apiRouter.get("/expenses", authenticateJWT, (req, res) => {
   res.json(result);
 });
 
-apiRouter.post("/expenses", authenticateJWT, requireRole([UserRole.ADMIN, UserRole.FINANCIAL_ANALYST, UserRole.FLEET_MANAGER]), (req: AuthenticatedRequest, res) => {
+apiRouter.post(
+  "/expenses",
+  authenticateJWT,
+  requireRole(FINANCIAL_ROLES),
+  (req: AuthenticatedRequest, res) => {
   const {
     vehicle_id,
     trip_id,
@@ -1528,7 +1966,11 @@ apiRouter.get("/dashboard/licence-alerts", authenticateJWT, (req, res) => {
 // 9. REPORTS MODULE ENDPOINTS
 // ============================================================================
 
-apiRouter.get("/reports/vehicle-performance", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/reports/vehicle-performance",
+  authenticateJWT,
+  requireRole(REPORT_ROLES),
+  (req, res) => {
   const list = db.vehicles.map(v => {
     const vTrips = db.trips.filter(t => t.vehicle_id === v.id);
     const completed = vTrips.filter(t => t.status === TripStatus.COMPLETED);
@@ -1554,7 +1996,11 @@ apiRouter.get("/reports/vehicle-performance", authenticateJWT, (req, res) => {
   res.json(list);
 });
 
-apiRouter.get("/reports/fuel-efficiency", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/reports/fuel-efficiency",
+  authenticateJWT,
+  requireRole(REPORT_ROLES),
+  (req, res) => {
   const list = db.vehicles.map(v => {
     const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
     const dist = completed.reduce((sum, t) => sum + (t.actual_distance || 0), 0);
@@ -1573,7 +2019,11 @@ apiRouter.get("/reports/fuel-efficiency", authenticateJWT, (req, res) => {
   res.json(list);
 });
 
-apiRouter.get("/reports/vehicle-roi", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/reports/vehicle-roi",
+  authenticateJWT,
+  requireRole(REPORT_ROLES),
+  (req, res) => {
   // ROI Formula: (Revenue - Operational Cost) / Acquisition Cost
   const list = db.vehicles.map(v => {
     const completed = db.trips.filter(t => t.vehicle_id === v.id && t.status === TripStatus.COMPLETED);
@@ -1600,7 +2050,11 @@ apiRouter.get("/reports/vehicle-roi", authenticateJWT, (req, res) => {
   res.json(list);
 });
 
-apiRouter.get("/reports/summary", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/reports/summary",
+  authenticateJWT,
+  requireRole(REPORT_ROLES),
+  (req, res) => {
   const { start_date, end_date, type } = req.query;
   const start = start_date ? new Date(start_date as string) : null;
   const end = end_date ? new Date(end_date as string) : null;
@@ -1664,7 +2118,11 @@ apiRouter.get("/reports/summary", authenticateJWT, (req, res) => {
   }
 });
 
-apiRouter.get("/reports/download", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/reports/download",
+  authenticateJWT,
+  requireRole(REPORT_ROLES),
+  (req, res) => {
   const { start_date, end_date, type } = req.query;
   const start = start_date ? new Date(start_date as string) : null;
   const end = end_date ? new Date(end_date as string) : null;
@@ -1711,7 +2169,11 @@ apiRouter.get("/reports/download", authenticateJWT, (req, res) => {
   res.status(200).send(csvContent);
 });
 
-apiRouter.get("/reports/export/csv", authenticateJWT, (req, res) => {
+apiRouter.get(
+  "/reports/export/csv",
+  authenticateJWT,
+  requireRole(REPORT_ROLES),
+  (req, res) => {
   const { type } = req.query;
 
   let csvContent = "";
@@ -1755,39 +2217,122 @@ apiRouter.get("/reports/export/csv", authenticateJWT, (req, res) => {
 // 10. NOTIFICATIONS ENDPOINTS
 // ============================================================================
 
-apiRouter.get("/notifications", authenticateJWT, (req: AuthenticatedRequest, res) => {
-  let list = db.notifications;
+function canAccessNotification(
+  userId: string,
+  notification: {
+    user_id: string;
+    notification_type: NotificationType;
+  },
+): boolean {
+  return (
+    notification.user_id === userId ||
+    notification.user_id === "all" ||
+    notification.notification_type ===
+      NotificationType.SYSTEM
+  );
+}
 
-  // Filter by user role/view rights or specific user
-  // If Driver: only show their notifications
-  if (req.user?.role === UserRole.DRIVER) {
-    list = list.filter(n => n.user_id === req.user!.id);
-  } else {
-    // Other roles view system notifications + notifications for their user ID
-    list = list.filter(n => n.user_id === req.user!.id || n.user_id === "all" || n.notification_type === NotificationType.SYSTEM);
-  }
+apiRouter.get(
+  "/notifications",
+  authenticateJWT,
+  (req: AuthenticatedRequest, res) => {
+    const list = db.notifications.filter(
+      (notification) =>
+        canAccessNotification(
+          req.user!.id,
+          notification,
+        ),
+    );
 
-  res.json(list);
-});
+    return res.json(list);
+  },
+);
 
-apiRouter.patch("/notifications/:id/read", authenticateJWT, (req, res) => {
-  const notif = db.notifications.find(n => n.id === req.params.id);
-  if (!notif) return res.status(404).json({ error: "Notification not found." });
+apiRouter.get(
+  "/notifications/count",
+  authenticateJWT,
+  (req: AuthenticatedRequest, res) => {
+    const count = db.notifications.filter(
+      (notification) =>
+        !notification.is_read &&
+        canAccessNotification(
+          req.user!.id,
+          notification,
+        ),
+    ).length;
 
-  notif.is_read = true;
-  db.save();
+    return res.json({
+      count,
+    });
+  },
+);
 
-  res.json({ success: true, notification: notif });
-});
+apiRouter.patch(
+  "/notifications/:id/read",
+  authenticateJWT,
+  (req: AuthenticatedRequest, res) => {
+    const notification =
+      db.notifications.find(
+        (candidate) =>
+          candidate.id === req.params.id,
+      );
 
-apiRouter.patch("/notifications/read-all", authenticateJWT, (req: AuthenticatedRequest, res) => {
-  db.notifications.forEach(n => {
-    if (n.user_id === req.user!.id || n.user_id === "all") {
-      n.is_read = true;
+    if (!notification) {
+      return res.status(404).json({
+        error: "Notification not found.",
+      });
     }
-  });
-  db.save();
-  res.json({ success: true });
-});
+
+    if (
+      !canAccessNotification(
+        req.user!.id,
+        notification,
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "You cannot modify another user's notification.",
+      });
+    }
+
+    notification.is_read = true;
+    db.save();
+
+    return res.json({
+      success: true,
+      notification,
+    });
+  },
+);
+
+apiRouter.patch(
+  "/notifications/read-all",
+  authenticateJWT,
+  (req: AuthenticatedRequest, res) => {
+    let updatedCount = 0;
+
+    for (const notification of db.notifications) {
+      if (
+        !notification.is_read &&
+        canAccessNotification(
+          req.user!.id,
+          notification,
+        )
+      ) {
+        notification.is_read = true;
+        updatedCount += 1;
+      }
+    }
+
+    if (updatedCount > 0) {
+      db.save();
+    }
+
+    return res.json({
+      success: true,
+      updated_count: updatedCount,
+    });
+  },
+);
 
 export { apiRouter };
